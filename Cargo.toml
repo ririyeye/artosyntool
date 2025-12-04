@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = [
+    "ar_dbg_client",
+    "rslog",
+]
+
+# 共享的工作空间依赖（可选）
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["full"] }

@@ -1,0 +1,36 @@
+[package]
+name = "rslog"
+version = "0.1.0"
+edition = "2021"
+description = "Embedded circular log storage with compression and power-safe design"
+
+[lints]
+workspace = true
+
+[dependencies]
+# 压缩库 - lz4 非常适合嵌入式，压缩/解压速度快
+lz4_flex = "0.11"
+
+# CRC32 校验 - 用于数据完整性验证
+crc32fast = "1.5"
+
+# 序列化 - 用于二进制数据结构
+bincode = "1.3"
+serde = { version = "1.0", features = ["derive"] }
+
+# 内存映射 - 可选，用于高效文件操作
+memmap2 = "0.9"
+
+# 字节序处理
+byteorder = "1.5"
+
+# 命令行解析
+clap = { version = "4.5", features = ["derive"] }
+
+# 时间处理
+chrono = { version = "0.4", default-features = false }
+
+[features]
+default = []
+# 如果目标平台不支持 mmap，可以禁用
+no-mmap = []

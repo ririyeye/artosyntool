@@ -1,0 +1,961 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Artosyn OSD 实时监控</title>
+    <script src="chart.umd.min.js"></script>
+    <script src="chartjs-adapter-date-fns.bundle.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: #e0e0e0;
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 20px;
+        }
+
+        .header h1 {
+            font-size: 1.8rem;
+            background: linear-gradient(90deg, #00d4ff, #7c3aed);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 10px;
+        }
+
+        .status-bar {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            flex-wrap: wrap;
+        }
+
+        .status-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 16px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 8px;
+        }
+
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+
+        .status-dot.connected {
+            background: #22c55e;
+        }
+
+        .status-dot.disconnected {
+            background: #ef4444;
+        }
+
+        .status-dot.locked {
+            background: #22c55e;
+        }
+
+        .status-dot.unlocked {
+            background: #ef4444;
+        }
+
+        @keyframes pulse {
+
+            0%,
+            100% {
+                opacity: 1;
+            }
+
+            50% {
+                opacity: 0.5;
+            }
+        }
+
+        .dashboard {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+            gap: 20px;
+            margin-top: 20px;
+        }
+
+        .card {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 12px;
+            padding: 20px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .card h3 {
+            font-size: 1rem;
+            color: #a0a0a0;
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .card h3 .icon {
+            font-size: 1.2rem;
+        }
+
+        .chart-container {
+            position: relative;
+            height: 200px;
+        }
+
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: 15px;
+        }
+
+        .metric {
+            text-align: center;
+            padding: 15px;
+            background: rgba(255, 255, 255, 0.03);
+            border-radius: 8px;
+        }
+
+        .metric-value {
+            font-size: 1.8rem;
+            font-weight: bold;
+            background: linear-gradient(90deg, #00d4ff, #7c3aed);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .metric-label {
+            font-size: 0.75rem;
+            color: #808080;
+            margin-top: 5px;
+        }
+
+        .controls {
+            display: flex;
+            justify-content: center;
+            gap: 10px;
+            margin-top: 20px;
+            flex-wrap: wrap;
+        }
+
+        button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            transition: all 0.2s;
+        }
+
+        button.primary {
+            background: linear-gradient(90deg, #00d4ff, #7c3aed);
+            color: white;
+        }
+
+        button.secondary {
+            background: rgba(255, 255, 255, 0.1);
+            color: #e0e0e0;
+        }
+
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.3);
+        }
+
+        select {
+            padding: 10px 15px;
+            border: none;
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.1);
+            color: #e0e0e0;
+            font-size: 0.9rem;
+            cursor: pointer;
+        }
+
+        .full-width {
+            grid-column: 1 / -1;
+        }
+
+        .agc-bars {
+            display: flex;
+            gap: 10px;
+            justify-content: space-around;
+            align-items: flex-end;
+            height: 150px;
+            padding: 20px;
+        }
+
+        .agc-bar-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            flex: 1;
+        }
+
+        .agc-bar {
+            width: 40px;
+            background: linear-gradient(to top, #00d4ff, #7c3aed);
+            border-radius: 4px 4px 0 0;
+            transition: height 0.3s ease;
+        }
+
+        .agc-label {
+            margin-top: 8px;
+            font-size: 0.75rem;
+            color: #808080;
+        }
+
+        .agc-value {
+            font-size: 0.9rem;
+            font-weight: bold;
+            margin-top: 4px;
+        }
+
+        @media (max-width: 768px) {
+            .dashboard {
+                grid-template-columns: 1fr;
+            }
+
+            .chart-container {
+                height: 150px;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="header">
+        <h1>📡 Artosyn OSD 实时监控</h1>
+        <div class="status-bar">
+            <div class="status-item">
+                <span class="status-dot disconnected" id="connectionStatus"></span>
+                <span id="connectionText">未连接</span>
+            </div>
+            <div class="status-item">
+                <span class="status-dot unlocked" id="lockStatus"></span>
+                <span id="lockText">未锁定</span>
+            </div>
+            <div class="status-item">
+                <span>设备角色:</span>
+                <span id="roleText">--</span>
+            </div>
+            <div class="status-item">
+                <span>数据包:</span>
+                <span id="packetCount">0</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="controls">
+        <select id="timeRange">
+            <option value="30">显示 30 秒</option>
+            <option value="60" selected>显示 60 秒</option>
+            <option value="120">显示 2 分钟</option>
+            <option value="300">显示 5 分钟</option>
+        </select>
+        <button class="secondary" onclick="clearCharts()">清除数据</button>
+        <button class="secondary" onclick="togglePause()">
+            <span id="pauseBtn">暂停</span>
+        </button>
+    </div>
+
+    <div class="dashboard">
+        <!-- SNR 曲线 -->
+        <div class="card">
+            <h3><span class="icon">📈</span> SNR 信噪比 (dB)</h3>
+            <div class="chart-container">
+                <canvas id="snrChart"></canvas>
+            </div>
+        </div>
+
+        <!-- LDPC 错误曲线 -->
+        <div class="card">
+            <h3><span class="icon">⚠️</span> LDPC 错误</h3>
+            <div class="chart-container">
+                <canvas id="ldpcChart"></canvas>
+            </div>
+        </div>
+
+        <!-- 功率曲线 -->
+        <div class="card">
+            <h3><span class="icon">⚡</span> 功率 (Main / Opt)</h3>
+            <div class="chart-container">
+                <canvas id="powerChart"></canvas>
+            </div>
+        </div>
+
+        <!-- MCS 曲线 -->
+        <div class="card">
+            <h3><span class="icon">📊</span> MCS 值</h3>
+            <div class="chart-container">
+                <canvas id="mcsChart"></canvas>
+            </div>
+        </div>
+
+        <!-- AGC 曲线图 -->
+        <div class="card">
+            <h3><span class="icon">🎚️</span> AGC 增益</h3>
+            <div class="chart-container">
+                <canvas id="agcChart"></canvas>
+            </div>
+        </div>
+
+        <!-- 实时数值 -->
+        <div class="card">
+            <h3><span class="icon">📋</span> 实时数值</h3>
+            <div class="metrics-grid">
+                <div class="metric">
+                    <div class="metric-value" id="snrValue">--</div>
+                    <div class="metric-label">SNR (dB)</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-value" id="ldpcValue">--</div>
+                    <div class="metric-label">LDPC Error</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-value" id="mainPwrValue">--</div>
+                    <div class="metric-label">Main Power</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-value" id="optPwrValue">--</div>
+                    <div class="metric-label">Opt Power</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-value" id="mcsValue">--</div>
+                    <div class="metric-label">MCS</div>
+                </div>
+                <div class="metric">
+                    <div class="metric-value" id="channelValue">--</div>
+                    <div class="metric-label">Channel</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // 配置
+        const MAX_DATA_POINTS = 3000; // 最多保留数据点
+        let timeRangeSeconds = 60;
+        let isPaused = false;
+        let packetCount = 0;
+
+        // 数据存储
+        const dataStore = {
+            timestamps: [],
+            snr: [],
+            ldpc: [],
+            mainPwr: [],
+            optPwr: [],
+            mcs: [],
+            agc0: [],
+            agc1: [],
+            agc2: [],
+            agc3: []
+        };
+
+        // 全局同步 - 使用相对位置（0-1之间的比例）
+        let syncXRatio = null;
+        let allCharts = [];
+
+        // 图表名称映射
+        const chartNames = {
+            'snrChart': 'SNR',
+            'ldpcChart': 'LDPC',
+            'powerChart': 'Power',
+            'mcsChart': 'MCS',
+            'agcChart': 'AGC'
+        };
+
+        // 根据相对位置获取对应的时间戳
+        function getTimestampFromRatio(chart, ratio) {
+            const xScale = chart.scales.x;
+            const x = xScale.left + ratio * (xScale.right - xScale.left);
+            return xScale.getValueForPixel(x);
+        }
+
+        // 查找最接近时间戳的数据值
+        function findValueAtTimestamp(dataArray, timestamp) {
+            if (!dataArray || dataArray.length === 0) return null;
+
+            // 二分查找最接近的点
+            let left = 0;
+            let right = dataArray.length - 1;
+
+            while (left < right) {
+                const mid = Math.floor((left + right) / 2);
+                if (dataArray[mid].x < timestamp) {
+                    left = mid + 1;
+                } else {
+                    right = mid;
+                }
+            }
+
+            // 检查左边的点是否更接近
+            if (left > 0) {
+                const diffLeft = Math.abs(dataArray[left - 1].x - timestamp);
+                const diffRight = Math.abs(dataArray[left].x - timestamp);
+                if (diffLeft < diffRight) {
+                    return dataArray[left - 1].y;
+                }
+            }
+
+            return dataArray[left].y;
+        }
+
+        // 垂直线插件 - 根据同步位置绘制并显示数值
+        const verticalLinePlugin = {
+            id: 'verticalLine',
+            afterDraw: (chart) => {
+                if (syncXRatio === null) return;
+
+                const ctx = chart.ctx;
+                const xScale = chart.scales.x;
+                const yScale = chart.scales.y;
+                const topY = yScale.top;
+                const bottomY = yScale.bottom;
+
+                // 根据比例计算x位置
+                const x = xScale.left + syncXRatio * (xScale.right - xScale.left);
+                const timestamp = xScale.getValueForPixel(x);
+
+                if (x >= xScale.left && x <= xScale.right) {
+                    ctx.save();
+
+                    // 绘制垂直虚线
+                    ctx.beginPath();
+                    ctx.setLineDash([5, 5]);
+                    ctx.moveTo(x, topY);
+                    ctx.lineTo(x, bottomY);
+                    ctx.lineWidth = 1;
+                    ctx.strokeStyle = 'rgba(255, 255, 255, 0.5)';
+                    ctx.stroke();
+
+                    // 获取数据并显示数值
+                    const datasets = chart.data.datasets;
+                    const values = [];
+
+                    datasets.forEach((dataset, index) => {
+                        const value = findValueAtTimestamp(dataset.data, timestamp);
+                        if (value !== null) {
+                            values.push({
+                                label: dataset.label,
+                                value: typeof value === 'number' ? (Number.isInteger(value) ? value : value.toFixed(1)) : value,
+                                color: dataset.borderColor
+                            });
+                        }
+                    });
+
+                    if (values.length > 0) {
+                        // 计算显示框的位置
+                        const padding = 8;
+                        const lineHeight = 18;
+                        const boxWidth = 90;
+                        const boxHeight = padding * 2 + values.length * lineHeight;
+
+                        // 决定框显示在左边还是右边
+                        let boxX = x + 10;
+                        if (boxX + boxWidth > xScale.right) {
+                            boxX = x - boxWidth - 10;
+                        }
+                        let boxY = topY + 10;
+
+                        // 绘制背景框
+                        ctx.fillStyle = 'rgba(30, 30, 50, 0.9)';
+                        ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+                        ctx.lineWidth = 1;
+                        ctx.setLineDash([]);
+                        ctx.beginPath();
+                        ctx.roundRect(boxX, boxY, boxWidth, boxHeight, 4);
+                        ctx.fill();
+                        ctx.stroke();
+
+                        // 绘制数值
+                        ctx.font = '12px sans-serif';
+                        ctx.textAlign = 'left';
+
+                        values.forEach((item, index) => {
+                            const textY = boxY + padding + 13 + index * lineHeight;
+
+                            // 绘制颜色点
+                            ctx.fillStyle = item.color;
+                            ctx.beginPath();
+                            ctx.arc(boxX + padding + 4, textY - 4, 4, 0, Math.PI * 2);
+                            ctx.fill();
+
+                            // 绘制文本
+                            ctx.fillStyle = '#e0e0e0';
+                            ctx.fillText(`${item.label}: ${item.value}`, boxX + padding + 14, textY);
+                        });
+                    }
+
+                    ctx.restore();
+                }
+            }
+        };
+
+        // 注册插件
+        Chart.register(verticalLinePlugin);
+
+        // Chart.js 通用配置
+        const chartOptions = {
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: false,
+            interaction: {
+                mode: 'index',
+                intersect: false
+            },
+            plugins: {
+                legend: {
+                    display: false
+                },
+                tooltip: {
+                    enabled: false
+                }
+            },
+            elements: {
+                line: {
+                    clip: true
+                }
+            },
+            scales: {
+                x: {
+                    type: 'linear',
+                    grid: {
+                        color: 'rgba(255,255,255,0.05)'
+                    },
+                    ticks: {
+                        color: '#808080',
+                        maxTicksLimit: 6,
+                        callback: function (value) {
+                            const date = new Date(value);
+                            return date.toTimeString().slice(0, 8);
+                        }
+                    }
+                },
+                y: {
+                    grid: {
+                        color: 'rgba(255,255,255,0.05)'
+                    },
+                    ticks: {
+                        color: '#808080'
+                    }
+                }
+            }
+        };
+
+        // 创建图表
+        const snrChart = new Chart(document.getElementById('snrChart'), {
+            type: 'line',
+            data: {
+                datasets: [{
+                    label: 'SNR',
+                    data: [],
+                    borderColor: '#00d4ff',
+                    backgroundColor: 'rgba(0,212,255,0.1)',
+                    fill: 'origin',
+                    tension: 0.4,
+                    pointRadius: 0,
+                    clip: true
+                }]
+            },
+            options: {
+                ...chartOptions,
+                scales: {
+                    ...chartOptions.scales,
+                    y: {
+                        ...chartOptions.scales.y,
+                        suggestedMin: 0,
+                        suggestedMax: 30
+                    }
+                }
+            }
+        });
+
+        const ldpcChart = new Chart(document.getElementById('ldpcChart'), {
+            type: 'line',
+            data: {
+                datasets: [{
+                    label: 'LDPC Error',
+                    data: [],
+                    borderColor: '#ef4444',
+                    backgroundColor: 'rgba(239,68,68,0.1)',
+                    fill: 'origin',
+                    tension: 0.4,
+                    pointRadius: 0,
+                    stepped: true,
+                    clip: true
+                }]
+            },
+            options: {
+                ...chartOptions,
+                scales: {
+                    ...chartOptions.scales,
+                    y: {
+                        ...chartOptions.scales.y,
+                        min: -1,
+                        max: 10
+                    }
+                }
+            }
+        });
+
+        const powerChart = new Chart(document.getElementById('powerChart'), {
+            type: 'line',
+            data: {
+                datasets: [
+                    {
+                        label: 'Main Power',
+                        data: [],
+                        borderColor: '#22c55e',
+                        backgroundColor: 'rgba(34,197,94,0.1)',
+                        fill: false,
+                        tension: 0.4,
+                        pointRadius: 0
+                    },
+                    {
+                        label: 'Opt Power',
+                        data: [],
+                        borderColor: '#f59e0b',
+                        backgroundColor: 'rgba(245,158,11,0.1)',
+                        fill: false,
+                        tension: 0.4,
+                        pointRadius: 0
+                    }
+                ]
+            },
+            options: {
+                ...chartOptions,
+                plugins: {
+                    ...chartOptions.plugins,
+                    legend: {
+                        display: true,
+                        labels: {
+                            color: '#808080'
+                        }
+                    }
+                }
+            }
+        });
+
+        const mcsChart = new Chart(document.getElementById('mcsChart'), {
+            type: 'line',
+            data: {
+                datasets: [{
+                    label: 'MCS',
+                    data: [],
+                    borderColor: '#7c3aed',
+                    backgroundColor: 'rgba(124,58,237,0.1)',
+                    fill: 'origin',
+                    tension: 0,
+                    pointRadius: 0,
+                    stepped: true,
+                    clip: true
+                }]
+            },
+            options: {
+                ...chartOptions,
+                scales: {
+                    ...chartOptions.scales,
+                    y: {
+                        ...chartOptions.scales.y,
+                        min: -1,
+                        max: 5
+                    }
+                }
+            }
+        });
+
+        // AGC 曲线图 - 4条不同颜色
+        const agcChart = new Chart(document.getElementById('agcChart'), {
+            type: 'line',
+            data: {
+                datasets: [
+                    {
+                        label: 'AGC0',
+                        data: [],
+                        borderColor: '#22c55e',
+                        backgroundColor: 'rgba(34,197,94,0.1)',
+                        fill: false,
+                        tension: 0.4,
+                        pointRadius: 0
+                    },
+                    {
+                        label: 'AGC1',
+                        data: [],
+                        borderColor: '#f59e0b',
+                        backgroundColor: 'rgba(245,158,11,0.1)',
+                        fill: false,
+                        tension: 0.4,
+                        pointRadius: 0
+                    },
+                    {
+                        label: 'AGC2',
+                        data: [],
+                        borderColor: '#ef4444',
+                        backgroundColor: 'rgba(239,68,68,0.1)',
+                        fill: false,
+                        tension: 0.4,
+                        pointRadius: 0
+                    },
+                    {
+                        label: 'AGC3',
+                        data: [],
+                        borderColor: '#8b5cf6',
+                        backgroundColor: 'rgba(139,92,246,0.1)',
+                        fill: false,
+                        tension: 0.4,
+                        pointRadius: 0
+                    }
+                ]
+            },
+            options: {
+                ...chartOptions,
+                plugins: {
+                    ...chartOptions.plugins,
+                    legend: {
+                        display: true,
+                        labels: {
+                            color: '#808080'
+                        }
+                    }
+                },
+                scales: {
+                    ...chartOptions.scales,
+                    y: {
+                        ...chartOptions.scales.y,
+                        min: 0,
+                        max: 200
+                    }
+                }
+            }
+        });
+
+        // 将所有图表添加到数组中用于同步
+        allCharts = [snrChart, ldpcChart, powerChart, mcsChart, agcChart];
+
+        // 重绘所有图表的垂直线（用于暂停状态）
+        function redrawAllCharts() {
+            allCharts.forEach(c => c.draw());
+        }
+
+        // 为所有图表添加鼠标事件
+        allCharts.forEach(chart => {
+            // 鼠标移动时更新同步位置（使用相对比例）
+            chart.canvas.addEventListener('mousemove', (e) => {
+                const rect = chart.canvas.getBoundingClientRect();
+                const x = e.clientX - rect.left;
+                const xScale = chart.scales.x;
+
+                if (x >= xScale.left && x <= xScale.right) {
+                    // 计算相对位置比例 (0-1)
+                    syncXRatio = (x - xScale.left) / (xScale.right - xScale.left);
+                    // 暂停时手动重绘所有图表
+                    if (isPaused) {
+                        redrawAllCharts();
+                    }
+                }
+            });
+
+            // 鼠标离开时清除同步
+            chart.canvas.addEventListener('mouseleave', () => {
+                syncXRatio = null;
+                // 暂停时手动重绘清除虚线
+                if (isPaused) {
+                    redrawAllCharts();
+                }
+            });
+        });
+
+        // WebSocket 连接
+        let ws = null;
+
+        function connect() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws`;
+
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => {
+                console.log('WebSocket connected');
+                document.getElementById('connectionStatus').className = 'status-dot connected';
+                document.getElementById('connectionText').textContent = '已连接';
+            };
+
+            ws.onclose = () => {
+                console.log('WebSocket disconnected');
+                document.getElementById('connectionStatus').className = 'status-dot disconnected';
+                document.getElementById('connectionText').textContent = '未连接';
+                // 自动重连
+                setTimeout(connect, 3000);
+            };
+
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+            };
+
+            ws.onmessage = (event) => {
+                if (isPaused) return;
+
+                try {
+                    const data = JSON.parse(event.data);
+                    handleOsdData(data);
+                } catch (e) {
+                    console.error('Failed to parse message:', e);
+                }
+            };
+        }
+
+        function handleOsdData(data) {
+            packetCount++;
+            document.getElementById('packetCount').textContent = packetCount;
+
+            // 使用本地时间而不是服务端时间戳，确保时间轴连续
+            const timestamp = new Date();
+
+            // 更新锁定状态
+            if (data.locked) {
+                document.getElementById('lockStatus').className = 'status-dot locked';
+                document.getElementById('lockText').textContent = '已锁定';
+            } else {
+                document.getElementById('lockStatus').className = 'status-dot unlocked';
+                document.getElementById('lockText').textContent = '未锁定';
+            }
+
+            // 更新角色
+            document.getElementById('roleText').textContent = data.role;
+
+            // 存储数据 - 使用时间戳数值
+            const ts = timestamp.getTime();
+            dataStore.timestamps.push(ts);
+            dataStore.snr.push({ x: ts, y: data.snr_db });
+            dataStore.ldpc.push({ x: ts, y: data.ldpc_error });
+            dataStore.mainPwr.push({ x: ts, y: data.main_pwr });
+            dataStore.optPwr.push({ x: ts, y: data.opt_pwr });
+            dataStore.mcs.push({ x: ts, y: data.mcs });
+            dataStore.agc0.push({ x: ts, y: data.agc[0] });
+            dataStore.agc1.push({ x: ts, y: data.agc[1] });
+            dataStore.agc2.push({ x: ts, y: data.agc[2] });
+            dataStore.agc3.push({ x: ts, y: data.agc[3] });
+
+            // 限制数据点数量
+            while (dataStore.timestamps.length > MAX_DATA_POINTS) {
+                dataStore.timestamps.shift();
+                dataStore.snr.shift();
+                dataStore.ldpc.shift();
+                dataStore.mainPwr.shift();
+                dataStore.optPwr.shift();
+                dataStore.mcs.shift();
+                dataStore.agc0.shift();
+                dataStore.agc1.shift();
+                dataStore.agc2.shift();
+                dataStore.agc3.shift();
+            }
+
+            // 更新实时数值
+            document.getElementById('snrValue').textContent = data.snr_db.toFixed(1);
+            document.getElementById('ldpcValue').textContent = data.ldpc_error;
+            document.getElementById('mainPwrValue').textContent = data.main_pwr;
+            document.getElementById('optPwrValue').textContent = data.opt_pwr;
+            document.getElementById('mcsValue').textContent = data.mcs;
+            document.getElementById('channelValue').textContent = data.channel.slot_rx_opt;
+        }
+
+        function updateCharts() {
+            const now = Date.now();
+            const minTime = now - timeRangeSeconds * 1000;
+
+            // 直接使用所有数据，让 Chart.js 自动处理范围
+            snrChart.data.datasets[0].data = dataStore.snr;
+            snrChart.options.scales.x.min = minTime;
+            snrChart.options.scales.x.max = now;
+
+            ldpcChart.data.datasets[0].data = dataStore.ldpc;
+            ldpcChart.options.scales.x.min = minTime;
+            ldpcChart.options.scales.x.max = now;
+
+            powerChart.data.datasets[0].data = dataStore.mainPwr;
+            powerChart.data.datasets[1].data = dataStore.optPwr;
+            powerChart.options.scales.x.min = minTime;
+            powerChart.options.scales.x.max = now;
+
+            mcsChart.data.datasets[0].data = dataStore.mcs;
+            mcsChart.options.scales.x.min = minTime;
+            mcsChart.options.scales.x.max = now;
+
+            // AGC 曲线图
+            agcChart.data.datasets[0].data = dataStore.agc0;
+            agcChart.data.datasets[1].data = dataStore.agc1;
+            agcChart.data.datasets[2].data = dataStore.agc2;
+            agcChart.data.datasets[3].data = dataStore.agc3;
+            agcChart.options.scales.x.min = minTime;
+            agcChart.options.scales.x.max = now;
+
+            // 更新所有图表，保留 tooltip 状态
+            allCharts.forEach(chart => {
+                chart.update('none');
+            });
+        }
+
+        // 使用 requestAnimationFrame 平滑更新图表
+        let animationFrameId = null;
+        function startSmoothUpdate() {
+            function tick() {
+                if (!isPaused && dataStore.snr.length > 0) {
+                    updateCharts();
+                }
+                animationFrameId = requestAnimationFrame(tick);
+            }
+            tick();
+        }
+
+        function clearCharts() {
+            dataStore.timestamps = [];
+            dataStore.snr = [];
+            dataStore.ldpc = [];
+            dataStore.mainPwr = [];
+            dataStore.optPwr = [];
+            dataStore.mcs = [];
+            dataStore.agc0 = [];
+            dataStore.agc1 = [];
+            dataStore.agc2 = [];
+            dataStore.agc3 = [];
+            packetCount = 0;
+            document.getElementById('packetCount').textContent = '0';
+            updateCharts();
+        }
+
+        function togglePause() {
+            isPaused = !isPaused;
+            document.getElementById('pauseBtn').textContent = isPaused ? '继续' : '暂停';
+        }
+
+        // 时间范围选择
+        document.getElementById('timeRange').addEventListener('change', (e) => {
+            timeRangeSeconds = parseInt(e.target.value);
+            updateCharts();
+        });
+
+        // 启动
+        connect();
+        startSmoothUpdate();
+    </script>
+</body>
+
+</html>

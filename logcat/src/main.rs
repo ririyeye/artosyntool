@@ -6,7 +6,9 @@
 //!
 //! 使用 rslog 存储日志到第一个二进制通道
 
+mod export;
 mod local;
+mod osd_meta;
 mod remote;
 
 use anyhow::Result;
@@ -78,6 +80,17 @@ enum Commands {
         #[arg(short = 'd', long, default_value_t = 1234)]
         dbg_port: u16,
     },
+
+    /// 导出已录制的 rslog 数据
+    Export {
+        /// 输入 rslog 文件路径
+        #[arg(short = 'i', long, default_value = "/factory/rslog.dat")]
+        input: String,
+
+        /// 导出目录（会自动创建）
+        #[arg(short = 'D', long = "out-dir", default_value = "logcat_export")]
+        out_dir: String,
+    },
 }
 
 #[tokio::main]
@@ -132,6 +145,14 @@ async fn main() -> Result<()> {
                 &output, max_size, &host, port, &user, password, key, &cmd, dbg_port,
             )
             .await?;
+        }
+        Some(Commands::Export { input, out_dir }) => {
+            info!("logcat: Export mode, input: {}", input);
+            info!("logcat: Export dir: {}", out_dir);
+            export::run_export(export::ExportOptions {
+                input: &input,
+                output_dir: &out_dir,
+            })?;
         }
     }
 

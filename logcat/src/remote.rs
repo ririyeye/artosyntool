@@ -1,5 +1,6 @@
 //! 远程模式: 通过 SSH 远程执行 ar_logcat，同时采集 ar_dbg_client OSD 数据
 
+use crate::osd_meta::{apply_role_from_payload, build_osd_descriptor};
 use anyhow::{anyhow, Result};
 use ar_dbg_client::OsdPlot;
 use bytes::BytesMut;
@@ -19,6 +20,9 @@ const OSD_CHANNEL: u8 = 1;
 
 /// OSD 重连间隔（秒）
 const OSD_RECONNECT_INTERVAL: u64 = 5;
+
+/// OSD 批量写入间隔（秒）
+const OSD_FLUSH_INTERVAL: u64 = 10;
 
 /// 获取当前时间戳（毫秒）
 fn current_timestamp() -> u64 {
@@ -42,36 +46,14 @@ impl client::Handler for SshHandler {
     }
 }
 
-/// 将 OsdPlot 序列化为二进制
-fn osd_to_bytes(osd: &OsdPlot) -> Vec<u8> {
-    let mut data = Vec::with_capacity(64);
-
-    // role (1B)
+/// 将单条 OSD 记录打包: 8字节时间戳(ms) + 1字节角色 + 2字节长度 + 原始OSD数据
+fn osd_record_to_bytes(ts: u64, osd: &OsdPlot) -> Vec<u8> {
+    let len = osd.raw_data.len() as u16;
+    let mut data = Vec::with_capacity(8 + 1 + 2 + osd.raw_data.len());
+    data.extend_from_slice(&ts.to_le_bytes());
     data.push(osd.role as u8);
-
-    // DEV 字段
-    data.push(osd.br_lock);
-    data.push(osd.br_ldpc_error);
-    data.extend_from_slice(&osd.br_snr_value.to_le_bytes());
-    data.extend_from_slice(&osd.br_agc_value);
-    data.push(osd.br_channel);
-    data.push(osd.slot_tx_channel);
-    data.push(osd.slot_rx_channel);
-    data.push(osd.slot_rx_opt_channel);
-
-    // AP 字段
-    data.push(osd.fch_lock);
-    data.push(osd.slot_lock);
-    data.extend_from_slice(&osd.slot_ldpc_error.to_le_bytes());
-    data.extend_from_slice(&osd.slot_snr_value.to_le_bytes());
-    data.extend_from_slice(&osd.slot_ldpc_after_error.to_le_bytes());
-    data.extend_from_slice(&osd.slot_agc_value);
-
-    // 公共字段
-    data.extend_from_slice(&osd.main_avr_pwr.to_le_bytes());
-    data.extend_from_slice(&osd.opt_avr_pwr.to_le_bytes());
-    data.push(osd.mcs_value);
-
+    data.extend_from_slice(&len.to_le_bytes());
+    data.extend_from_slice(&osd.raw_data);
     data
 }
 
@@ -169,6 +151,7 @@ async fn run_osd_collector(
     );
 
     let mut reconnect_count = 0u64;
+    let mut descriptor_written = false;
 
     while running.load(Ordering::SeqCst) {
         // 尝试连接
@@ -194,7 +177,15 @@ async fn run_osd_collector(
         info!("osd: Connected to {}", addr);
 
         // 运行 OSD 流接收
-        if let Err(e) = run_osd_stream(stream, &writer, &running, &osd_count).await {
+        if let Err(e) = run_osd_stream(
+            stream,
+            &writer,
+            &running,
+            &osd_count,
+            &mut descriptor_written,
+        )
+        .await
+        {
             if running.load(Ordering::SeqCst) {
                 warn!("osd: Stream error: {}", e);
             }
@@ -223,12 +214,13 @@ async fn run_osd_collector(
     info!("osd: Collector stopped, {} reconnects", reconnect_count);
 }
 
-/// 运行 OSD 数据流接收（可中断）
+/// 运行 OSD 数据流接收（可中断，批量写入）
 async fn run_osd_stream(
     mut stream: TcpStream,
     writer: &Arc<Mutex<StreamWriter>>,
     running: &Arc<AtomicBool>,
     osd_count: &Arc<AtomicU64>,
+    descriptor_written: &mut bool,
 ) -> Result<()> {
     use ar_dbg_client::protocol::{self, Message, MsgId};
 
@@ -241,15 +233,47 @@ async fn run_osd_stream(
     let mut buf = BytesMut::with_capacity(8192);
     let mut read_buf = [0u8; 4096];
 
+    // OSD 批量缓冲区: 每条记录格式 [ts:8B][role:1B][raw_data]
+    let mut osd_batch: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let mut batch_count: u64 = 0;
+    let mut last_flush = Instant::now();
+    let flush_interval = Duration::from_secs(OSD_FLUSH_INTERVAL);
+
     loop {
         // 每次循环检查停止信号
         if !running.load(Ordering::SeqCst) {
             info!("osd: Stopping stream due to signal");
+            // 写入剩余批量数据
+            if !osd_batch.is_empty() {
+                let mut w = writer.lock().await;
+                if let Err(e) = w.write_binary_ch(OSD_CHANNEL, current_timestamp(), &osd_batch) {
+                    error!("osd: Final batch write error: {}", e);
+                }
+            }
             // 发送停止 OSD 命令
             let stop_msg = protocol::create_stop_osd_msg(1);
             let stop_data = stop_msg.encode();
             let _ = stream.write_all(&stop_data).await;
             return Ok(());
+        }
+
+        // 检查是否需要定时刷新批量数据
+        if !osd_batch.is_empty() && last_flush.elapsed() >= flush_interval {
+            let ts = current_timestamp();
+            {
+                let mut w = writer.lock().await;
+                if let Err(e) = w.write_binary_ch(OSD_CHANNEL, ts, &osd_batch) {
+                    error!("osd: Batch write error: {}", e);
+                }
+            }
+            debug!(
+                "osd: Flushed {} records ({} bytes)",
+                batch_count,
+                osd_batch.len()
+            );
+            osd_batch.clear();
+            batch_count = 0;
+            last_flush = Instant::now();
         }
 
         // 使用带超时的读取，这样可以定期检查停止信号
@@ -259,6 +283,14 @@ async fn run_osd_stream(
         match read_result {
             Ok(Ok(0)) => {
                 warn!("osd: Connection closed by peer");
+                // 写入剩余批量数据
+                if !osd_batch.is_empty() {
+                    let mut w = writer.lock().await;
+                    if let Err(e) = w.write_binary_ch(OSD_CHANNEL, current_timestamp(), &osd_batch)
+                    {
+                        error!("osd: Final batch write error: {}", e);
+                    }
+                }
                 return Err(anyhow!("Connection closed"));
             }
             Ok(Ok(n)) => {
@@ -269,14 +301,28 @@ async fn run_osd_stream(
                 while let Some(msg) = Message::decode(&mut buf)? {
                     if msg.header.msg_id == MsgId::Baseband {
                         if let Some(osd) = parse_osd_from_bb_message(&msg) {
-                            let data = osd_to_bytes(&osd);
                             let ts = current_timestamp();
-                            {
+
+                            // 首次写入 descriptor
+                            if !*descriptor_written {
                                 let mut w = writer.lock().await;
-                                if let Err(e) = w.write_binary_ch(OSD_CHANNEL, ts, &data) {
-                                    error!("osd: Write error: {}", e);
+                                match serde_json::to_string(&build_osd_descriptor(osd.role)) {
+                                    Ok(json) => {
+                                        if let Err(e) = w.write_text_ch(OSD_CHANNEL, ts, &json) {
+                                            error!("osd: Write descriptor error: {}", e);
+                                        } else {
+                                            *descriptor_written = true;
+                                        }
+                                    }
+                                    Err(e) => error!("osd: Serialize descriptor error: {}", e),
                                 }
                             }
+
+                            // 追加到批量缓冲区
+                            let record = osd_record_to_bytes(ts, &osd);
+                            osd_batch.extend_from_slice(&record);
+                            batch_count += 1;
+
                             let count = osd_count.fetch_add(1, Ordering::SeqCst) + 1;
                             if count % 100 == 0 {
                                 eprint!("\rosd: {} records", count);
@@ -286,10 +332,18 @@ async fn run_osd_stream(
                 }
             }
             Ok(Err(e)) => {
+                // 写入剩余批量数据
+                if !osd_batch.is_empty() {
+                    let mut w = writer.lock().await;
+                    if let Err(e) = w.write_binary_ch(OSD_CHANNEL, current_timestamp(), &osd_batch)
+                    {
+                        error!("osd: Final batch write error: {}", e);
+                    }
+                }
                 return Err(anyhow!("Read error: {}", e));
             }
             Err(_) => {
-                // 超时，继续循环检查停止信号
+                // 超时，继续循环检查停止信号和定时刷新
             }
         }
     }
@@ -307,6 +361,7 @@ fn parse_osd_from_bb_message(msg: &ar_dbg_client::protocol::Message) -> Option<O
 
     if rcv_header.bb_msg_id == BbCmd::GetOsdInfo.to_local_u8() {
         let osd_data = &msg.payload[2..];
+        apply_role_from_payload(osd_data);
         OsdPlot::from_bytes_debug(osd_data)
     } else {
         None

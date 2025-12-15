@@ -3,3 +3,5 @@ Cargo.lock
 .github/copilot-instructions.md
 .vscode/
 rslog_remote.dat
+logcat_export
+rslog_remote.dat.log

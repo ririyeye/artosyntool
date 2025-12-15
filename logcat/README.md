@@ -7,6 +7,7 @@
 - **本地模式**: 本地执行 `ar_logcat` 命令
 - **远程模式**: 通过 SSH 连接到远程机器执行 `ar_logcat`
 - 使用 rslog 存储日志到二进制通道 0
+- **导出模式**: 将 rslog 中的 ar_logcat 与 OSD 数据拆分导出（日志文本 + OSD CSV）
 
 ## 使用方法
 
@@ -31,6 +32,14 @@ logcat remote -H 192.168.1.100 -u root -k ~/.ssh/id_rsa
 
 # 指定自定义命令
 logcat remote -H 192.168.1.100 -u root -P password -c "ar_logcat -v"
+
+# 从已有 rslog 导出
+logcat export -i /factory/rslog.dat -D ./logcat_export
+
+# 导出结果
+# - ar_logcat.txt : ar_logcat 文本（带时间戳）
+# - osd.csv       : OSD 字段 CSV（首列时间戳，第二列开始按字段顺序）
+# - osd_descriptor.json : OSD 字段说明（角色 + 字段表头）
 ```
 
 ## 命令行参数
@@ -47,6 +56,7 @@ Options:
 Commands:
   local   本地模式: 本地执行 ar_logcat
   remote  远程模式: 通过 SSH 远程执行 ar_logcat
+  export  导出模式: 输出 ar_logcat 文本与 OSD CSV
 ```
 
 ### local 子命令

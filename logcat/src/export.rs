@@ -90,7 +90,7 @@ pub fn run_export(opts: ExportOptions<'_>) -> Result<()> {
 
                             if !osd_header_written {
                                 let mut header = Vec::with_capacity(osd_fields(role).len() + 1);
-                                header.push("timestamp_ms".to_string());
+                                header.push("timestamp".to_string());
                                 header.extend(osd_fields(role).iter().map(|s| (*s).to_string()));
                                 writeln!(osd_writer, "{}", header.join(","))?;
                                 osd_header_written = true;
@@ -115,7 +115,7 @@ pub fn run_export(opts: ExportOptions<'_>) -> Result<()> {
 
                         if !osd_header_written {
                             let mut header = Vec::with_capacity(osd_fields(role).len() + 1);
-                            header.push("timestamp_ms".to_string());
+                            header.push("timestamp".to_string());
                             header.extend(osd_fields(role).iter().map(|s| (*s).to_string()));
                             writeln!(osd_writer, "{}", header.join(","))?;
                             osd_header_written = true;
@@ -471,10 +471,13 @@ fn parse_compact_osd(data: &[u8]) -> Option<(DeviceRole, OsdPlot)> {
 
 fn format_osd_row(ts: u64, role: DeviceRole, osd: &OsdPlot) -> String {
     let mut fields = Vec::new();
-    fields.push(ts.to_string());
+    // 将毫秒时间戳转换为秒（浮点数），PlotJuggler 更好识别
+    let ts_sec = ts as f64 / 1000.0;
+    fields.push(format!("{:.3}", ts_sec));
     match role {
         DeviceRole::Dev => {
-            fields.push("DEV".to_string());
+            // role_id: DEV=0
+            fields.push("0".to_string());
             fields.push(osd.br_lock.to_string());
             fields.push(osd.br_ldpc_error.to_string());
             fields.push(osd.br_snr_value.to_string());
@@ -491,7 +494,8 @@ fn format_osd_row(ts: u64, role: DeviceRole, osd: &OsdPlot) -> String {
             fields.push(osd.mcs_value.to_string());
         }
         DeviceRole::Ap => {
-            fields.push("AP".to_string());
+            // role_id: AP=1
+            fields.push("1".to_string());
             fields.push(osd.fch_lock.to_string());
             fields.push(osd.slot_lock.to_string());
             fields.push(osd.slot_ldpc_error.to_string());

@@ -2,13 +2,15 @@
 //!
 //! 两种模式:
 //! 1. 本地模式: 本地执行 ar_logcat 命令抓取日志
-//! 2. 远程模式: 通过 SSH 连接到远程机器执行 ar_logcat
+//! 2. 远程模式: 通过 SSH 连接到远程机器执行 ar_logcat，同时抓取寄存器数据
 //!
-//! 使用 rslog 存储日志到第一个二进制通道
+//! 使用 rslog 存储：
+//! - 通道0: logcat 文本
+//! - 通道1: 寄存器跟踪数据（二进制格式）
 
 mod export;
 mod local;
-mod osd_meta;
+mod reg_meta;
 mod remote;
 
 use anyhow::Result;
@@ -20,6 +22,7 @@ const DEFAULT_OUTPUT: &str = "/factory/rslog.dat";
 const DEFAULT_MAX_SIZE: u64 = 3_145_728; // 3 MB
 const REMOTE_DEFAULT_OUTPUT: &str = "rslog_remote.dat";
 const REMOTE_DEFAULT_MAX_SIZE: u64 = 64 * 1024 * 1024; // 64 MB
+const DEFAULT_REG_PORT: u16 = 12345;
 
 #[derive(Parser)]
 #[command(name = "logcat")]
@@ -50,7 +53,7 @@ enum Commands {
         cmd: String,
     },
 
-    /// 远程模式: 通过 SSH 远程执行 ar_logcat
+    /// 远程模式: 通过 SSH 远程执行 ar_logcat，同时抓取寄存器数据
     Remote {
         /// SSH 主机地址
         #[arg(short = 'H', long)]
@@ -76,9 +79,13 @@ enum Commands {
         #[arg(short, long, default_value = "ar_logcat")]
         cmd: String,
 
-        /// ar_dbg 服务端口
-        #[arg(short = 'd', long, default_value_t = 1234)]
-        dbg_port: u16,
+        /// 寄存器跟踪服务端口
+        #[arg(short = 'r', long, default_value_t = DEFAULT_REG_PORT)]
+        reg_port: u16,
+
+        /// 寄存器配置 JSON 文件路径（指定要抓取的寄存器）
+        #[arg(short = 'C', long)]
+        config: Option<String>,
     },
 
     /// 导出已录制的 rslog 数据
@@ -131,7 +138,8 @@ async fn main() -> Result<()> {
             password,
             key,
             cmd,
-            dbg_port,
+            reg_port,
+            config,
         }) => {
             let output = cli
                 .output
@@ -141,9 +149,28 @@ async fn main() -> Result<()> {
             info!("logcat: Remote mode, host: {}:{}", host, port);
             info!("logcat: Output file: {}", output);
             info!("logcat: Max size: {} bytes", max_size);
-            remote::run_remote(
-                &output, max_size, &host, port, &user, password, key, &cmd, dbg_port,
-            )
+
+            // 加载寄存器配置
+            let reg_config = if let Some(config_path) = &config {
+                info!("logcat: Loading register config from {}", config_path);
+                Some(reg_meta::RegTraceConfig::from_file(config_path)?)
+            } else {
+                info!("logcat: No register config provided, will skip register capture");
+                None
+            };
+
+            remote::run_remote(remote::RemoteOptions {
+                output: &output,
+                max_size,
+                host: &host,
+                ssh_port: port,
+                user: &user,
+                password: password.as_deref(),
+                key: key.as_deref(),
+                cmd: &cmd,
+                reg_port,
+                reg_config,
+            })
             .await?;
         }
         Some(Commands::Export { input, out_dir }) => {

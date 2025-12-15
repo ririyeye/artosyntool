@@ -1,4 +1,4 @@
-//! Artosyn Debug Service 客户端
+//! 寄存器跟踪服务客户端
 
 use bytes::BytesMut;
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -6,15 +6,10 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
-use crate::osd::{set_device_role, DeviceRole, OsdPlot};
-use crate::protocol::{self, BbCmd, BbRcvMsgHeader, Message, MsgId};
-
-/// 默认端口
-pub const DEFAULT_PORT: u16 = 1234;
+use crate::protocol::{self, *};
 
 /// 客户端错误
 #[derive(Error, Debug)]
@@ -27,16 +22,18 @@ pub enum ClientError {
     ConnectionClosed,
     #[error("send failed")]
     SendFailed,
+    #[error("timeout")]
+    Timeout,
+    #[error("server error: {0}")]
+    ServerError(ErrorCode),
 }
-
-/// OSD 数据回调
-pub type OsdCallback = Box<dyn Fn(&OsdPlot) + Send + Sync>;
 
 /// 客户端配置
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
     pub host: String,
     pub port: u16,
+    pub timeout_secs: u64,
 }
 
 impl Default for ClientConfig {
@@ -44,17 +41,18 @@ impl Default for ClientConfig {
         Self {
             host: "192.168.1.100".to_string(),
             port: DEFAULT_PORT,
+            timeout_secs: 5,
         }
     }
 }
 
-/// Artosyn Debug Service 客户端
-pub struct ArDbgClient {
+/// 寄存器跟踪服务客户端
+pub struct RegTraceClient {
     config: ClientConfig,
     seq_num: Arc<AtomicU16>,
 }
 
-impl ArDbgClient {
+impl RegTraceClient {
     /// 创建新客户端
     pub fn new(config: ClientConfig) -> Self {
         Self {
@@ -78,144 +76,22 @@ impl ArDbgClient {
     }
 
     /// 发送消息
-    pub async fn send_message(stream: &mut TcpStream, msg: &Message) -> Result<(), ClientError> {
+    async fn send_message(stream: &mut TcpStream, msg: &Message) -> Result<(), ClientError> {
         let data = msg.encode();
         debug!("Sending {} bytes: {:02x?}", data.len(), &data);
         stream.write_all(&data).await?;
         Ok(())
     }
 
-    /// 读取超时时间（秒）
-    const READ_TIMEOUT_SECS: u64 = 5;
-
-    /// 启动 OSD 并接收数据
-    pub async fn start_osd_stream(
-        &self,
-        mut on_osd: impl FnMut(&OsdPlot) + Send + 'static,
-    ) -> Result<(), ClientError> {
-        let mut stream = self.connect().await?;
-
-        // 发送启动 OSD 命令
-        let start_msg = protocol::create_start_osd_msg(self.next_seq());
-        Self::send_message(&mut stream, &start_msg).await?;
-        info!("Sent start OSD command");
-
-        // 接收数据
-        let mut buf = BytesMut::with_capacity(8192);
-        let mut read_buf = [0u8; 4096];
-
-        loop {
-            // 读取数据（带超时）
-            let read_result = timeout(
-                Duration::from_secs(Self::READ_TIMEOUT_SECS),
-                stream.read(&mut read_buf),
-            )
-            .await;
-
-            let n = match read_result {
-                Ok(Ok(0)) => {
-                    warn!("Connection closed by peer");
-                    return Err(ClientError::ConnectionClosed);
-                }
-                Ok(Ok(n)) => n,
-                Ok(Err(e)) => {
-                    error!("Read error: {}", e);
-                    return Err(ClientError::ConnectionFailed(e));
-                }
-                Err(_) => {
-                    warn!(
-                        "Read timeout ({}s), connection may be lost",
-                        Self::READ_TIMEOUT_SECS
-                    );
-                    return Err(ClientError::ConnectionClosed);
-                }
-            };
-
-            buf.extend_from_slice(&read_buf[..n]);
-            debug!("Received {} bytes, buffer size: {}", n, buf.len());
-
-            // 尝试解析消息
-            while let Some(msg) = Message::decode(&mut buf)? {
-                debug!(
-                    "Decoded message: msg_id={:?}, payload_len={}",
-                    msg.header.msg_id,
-                    msg.payload.len()
-                );
-
-                if msg.header.msg_id == MsgId::Baseband {
-                    self.handle_bb_message(&msg, &mut on_osd);
-                }
-            }
-        }
-    }
-
-    /// 处理 BB 消息
-    fn handle_bb_message(&self, msg: &Message, on_osd: &mut impl FnMut(&OsdPlot)) {
-        if msg.payload.len() < 2 {
-            warn!("BB message too short: {} bytes", msg.payload.len());
-            return;
-        }
-
-        let rcv_header = match BbRcvMsgHeader::from_bytes(&msg.payload) {
-            Some(h) => h,
-            None => {
-                warn!("Failed to parse BB rcv header");
-                return;
-            }
-        };
-
-        debug!(
-            "BB msg: id=0x{:02x}, ret_type=0x{:02x}",
-            rcv_header.bb_msg_id, rcv_header.ret_type
-        );
-
-        // 检查是否是 OSD 消息
-        if rcv_header.bb_msg_id == BbCmd::GetOsdInfo.to_local_u8() {
-            let osd_data = &msg.payload[2..];
-
-            if let Some(osd) = OsdPlot::from_bytes_debug(osd_data) {
-                on_osd(&osd);
-            }
-        }
-    }
-
-    /// 发送停止 OSD 命令
-    pub async fn stop_osd(&self, stream: &mut TcpStream) -> Result<(), ClientError> {
-        let stop_msg = protocol::create_stop_osd_msg(self.next_seq());
-        Self::send_message(stream, &stop_msg).await?;
-        info!("Sent stop OSD command");
-        Ok(())
-    }
-
-    /// 发送自定义 BB 命令
-    pub async fn send_bb_cmd(
-        &self,
+    /// 接收消息
+    async fn recv_message(
         stream: &mut TcpStream,
-        cmd: BbCmd,
-        data: &[u8],
-    ) -> Result<(), ClientError> {
-        let mut payload = Vec::with_capacity(1 + data.len());
-        payload.push(cmd.to_local_u8());
-        payload.extend_from_slice(data);
+        timeout_secs: u64,
+    ) -> Result<Message, ClientError> {
+        let mut buf = BytesMut::with_capacity(4096);
+        let mut read_buf = [0u8; 1024];
 
-        let msg = Message::new_bb_msg(self.next_seq(), payload);
-        Self::send_message(stream, &msg).await?;
-        Ok(())
-    }
-
-    /// 获取设备信息（角色）
-    /// 返回设备角色: 0=DEV, 1=AP
-    pub async fn get_device_role(&self, stream: &mut TcpStream) -> Result<DeviceRole, ClientError> {
-        // 发送 GET_DEVICE_INFO 命令 (0x02)
-        let msg = protocol::create_get_device_info_msg(self.next_seq());
-        Self::send_message(stream, &msg).await?;
-        info!("Sent GET_DEVICE_INFO command");
-
-        // 接收响应，带超时
-        let mut buf = BytesMut::with_capacity(256);
-        let mut read_buf = [0u8; 256];
-
-        let result = timeout(Duration::from_secs(3), async {
+        let result = timeout(Duration::from_secs(timeout_secs), async {
             loop {
                 let n = stream.read(&mut read_buf).await?;
                 if n == 0 {
@@ -223,122 +99,172 @@ impl ArDbgClient {
                 }
 
                 buf.extend_from_slice(&read_buf[..n]);
-                debug!("Received {} bytes for device info", n);
+                debug!("Received {} bytes, buffer size: {}", n, buf.len());
 
-                // 尝试解析消息
-                while let Some(msg) = Message::decode(&mut buf)? {
-                    if msg.header.msg_id == MsgId::Baseband {
-                        if let Some(rcv_header) = BbRcvMsgHeader::from_bytes(&msg.payload) {
-                            if rcv_header.bb_msg_id == BbCmd::GetDeviceInfo.to_local_u8() {
-                                // device_info_t 结构:
-                                // payload[0] = bb_msg_id
-                                // payload[1] = ret_type
-                                // payload[2..6] = magic_header[4]
-                                // payload[6] = skyGround (0x00=AP, 0x01=DEV)
-                                if msg.payload.len() >= 7 {
-                                    let sky_ground = msg.payload[6];
-                                    // skyGround: 0x00=AP, 0x01=DEV
-                                    let role = if sky_ground == 0 {
-                                        DeviceRole::Ap
-                                    } else {
-                                        DeviceRole::Dev
-                                    };
-                                    info!(
-                                        "Device role: {:?} (skyGround=0x{:02x})",
-                                        role, sky_ground
-                                    );
-                                    return Ok(role);
-                                }
-                            }
-                        }
-                    }
+                if let Some(msg) = Message::decode(&mut buf)? {
+                    return Ok(msg);
                 }
             }
         })
         .await;
 
         match result {
-            Ok(Ok(role)) => Ok(role),
+            Ok(Ok(msg)) => Ok(msg),
             Ok(Err(e)) => Err(e),
-            Err(_) => {
-                warn!("Timeout waiting for device info, defaulting to DEV");
-                Ok(DeviceRole::Dev)
-            }
+            Err(_) => Err(ClientError::Timeout),
         }
     }
 
-    /// 启动 OSD 并接收数据（自动检测设备角色）
-    pub async fn start_osd_stream_auto_role(
+    /// 发送请求并等待响应
+    async fn request(&self, stream: &mut TcpStream, msg: Message) -> Result<Message, ClientError> {
+        Self::send_message(stream, &msg).await?;
+        Self::recv_message(stream, self.config.timeout_secs).await
+    }
+
+    /// 心跳检测
+    pub async fn ping(&self, stream: &mut TcpStream) -> Result<PingResponse, ClientError> {
+        let msg = create_ping_msg(self.next_seq());
+        let resp = self.request(stream, msg).await?;
+
+        PingResponse::from_payload(&resp.payload)
+            .ok_or(ClientError::Protocol(ProtocolError::InvalidMagic))
+    }
+
+    /// 获取版本信息
+    pub async fn get_version(
         &self,
-        mut on_osd: impl FnMut(&OsdPlot) + Send + 'static,
+        stream: &mut TcpStream,
+    ) -> Result<VersionResponse, ClientError> {
+        let msg = create_version_msg(self.next_seq());
+        let resp = self.request(stream, msg).await?;
+
+        VersionResponse::from_payload(&resp.payload)
+            .ok_or(ClientError::Protocol(ProtocolError::InvalidMagic))
+    }
+
+    /// 配置抓取项
+    pub async fn config(
+        &self,
+        stream: &mut TcpStream,
+        config: &ConfigRequest,
+    ) -> Result<ConfigResponse, ClientError> {
+        let msg = create_config_msg(self.next_seq(), config);
+        let resp = self.request(stream, msg).await?;
+
+        ConfigResponse::from_payload(&resp.payload)
+            .ok_or(ClientError::Protocol(ProtocolError::InvalidMagic))
+    }
+
+    /// 启动采集
+    pub async fn start(
+        &self,
+        stream: &mut TcpStream,
+        clear_buffer: bool,
+    ) -> Result<GenericResponse, ClientError> {
+        let msg = create_start_msg(self.next_seq(), clear_buffer);
+        let resp = self.request(stream, msg).await?;
+
+        GenericResponse::from_payload(&resp.payload)
+            .ok_or(ClientError::Protocol(ProtocolError::InvalidMagic))
+    }
+
+    /// 停止采集
+    pub async fn stop(&self, stream: &mut TcpStream) -> Result<GenericResponse, ClientError> {
+        let msg = create_stop_msg(self.next_seq());
+        let resp = self.request(stream, msg).await?;
+
+        GenericResponse::from_payload(&resp.payload)
+            .ok_or(ClientError::Protocol(ProtocolError::InvalidMagic))
+    }
+
+    /// 查询状态
+    pub async fn status(&self, stream: &mut TcpStream) -> Result<StatusResponse, ClientError> {
+        let msg = create_status_msg(self.next_seq());
+        let resp = self.request(stream, msg).await?;
+
+        StatusResponse::from_payload(&resp.payload)
+            .ok_or(ClientError::Protocol(ProtocolError::InvalidMagic))
+    }
+
+    /// 拉取数据
+    pub async fn fetch(
+        &self,
+        stream: &mut TcpStream,
+        max_records: u8,
+        clear_after_read: bool,
+    ) -> Result<FetchResponse, ClientError> {
+        let msg = create_fetch_msg(self.next_seq(), max_records, clear_after_read);
+        let resp = self.request(stream, msg).await?;
+
+        FetchResponse::from_payload(&resp.payload)
+            .ok_or(ClientError::Protocol(ProtocolError::InvalidMagic))
+    }
+
+    /// 清空缓冲区
+    pub async fn clear(&self, stream: &mut TcpStream) -> Result<GenericResponse, ClientError> {
+        let msg = create_clear_msg(self.next_seq());
+        let resp = self.request(stream, msg).await?;
+
+        GenericResponse::from_payload(&resp.payload)
+            .ok_or(ClientError::Protocol(ProtocolError::InvalidMagic))
+    }
+
+    /// 配置并启动采集（默认配置：第一页寄存器）
+    pub async fn start_trace_default(&self, stream: &mut TcpStream) -> Result<(), ClientError> {
+        // 使用默认配置（第一页的寄存器）
+        let config = ConfigRequest::default();
+
+        info!(
+            "Configuring trace with {} items on page 0",
+            config.items.len()
+        );
+        let config_resp = self.config(stream, &config).await?;
+        if config_resp.result != ErrorCode::Ok {
+            error!("Config failed: {}", config_resp.result);
+            return Err(ClientError::ServerError(config_resp.result));
+        }
+        info!(
+            "Config OK: items={}, sample_div={}, buffer_depth={}",
+            config_resp.actual_items,
+            config_resp.actual_sample_div,
+            config_resp.actual_buffer_depth
+        );
+
+        // 启动采集
+        let start_resp = self.start(stream, true).await?;
+        if start_resp.result != ErrorCode::Ok {
+            error!("Start failed: {}", start_resp.result);
+            return Err(ClientError::ServerError(start_resp.result));
+        }
+        info!("Trace started");
+
+        Ok(())
+    }
+
+    /// 持续监控模式
+    pub async fn monitor(
+        &self,
+        stream: &mut TcpStream,
+        interval_ms: u64,
+        max_records: u8,
+        mut on_record: impl FnMut(&TraceRecord),
     ) -> Result<(), ClientError> {
-        let mut stream = self.connect().await?;
-
-        // 首先获取设备角色
-        let role = self.get_device_role(&mut stream).await?;
-        set_device_role(role);
-        info!("Device role set to: {:?}", role);
-
-        // 发送启动 OSD 命令
-        let start_msg = protocol::create_start_osd_msg(self.next_seq());
-        Self::send_message(&mut stream, &start_msg).await?;
-        info!("Sent start OSD command");
-
-        // 接收数据
-        let mut buf = BytesMut::with_capacity(8192);
-        let mut read_buf = [0u8; 4096];
+        info!("Starting monitor mode (interval={}ms)", interval_ms);
 
         loop {
-            // 读取数据（带超时）
-            let read_result = timeout(
-                Duration::from_secs(Self::READ_TIMEOUT_SECS),
-                stream.read(&mut read_buf),
-            )
-            .await;
-
-            let n = match read_result {
-                Ok(Ok(0)) => {
-                    warn!("Connection closed by peer");
-                    return Err(ClientError::ConnectionClosed);
-                }
-                Ok(Ok(n)) => n,
-                Ok(Err(e)) => {
-                    error!("Read error: {}", e);
-                    return Err(ClientError::ConnectionFailed(e));
-                }
-                Err(_) => {
-                    warn!(
-                        "Read timeout ({}s), connection may be lost",
-                        Self::READ_TIMEOUT_SECS
-                    );
-                    return Err(ClientError::ConnectionClosed);
-                }
-            };
-
-            buf.extend_from_slice(&read_buf[..n]);
-            debug!("Received {} bytes, buffer size: {}", n, buf.len());
-
-            // 尝试解析消息
-            while let Some(msg) = Message::decode(&mut buf)? {
-                debug!(
-                    "Decoded message: msg_id={:?}, payload_len={}",
-                    msg.header.msg_id,
-                    msg.payload.len()
-                );
-
-                if msg.header.msg_id == MsgId::Baseband {
-                    self.handle_bb_message(&msg, &mut on_osd);
+            // 查询状态
+            let status = self.status(stream).await?;
+            if status.record_count > 0 {
+                // 拉取数据
+                let fetch_resp = self.fetch(stream, max_records, true).await?;
+                if fetch_resp.result == ErrorCode::Ok {
+                    for record in &fetch_resp.records {
+                        on_record(record);
+                    }
                 }
             }
+
+            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
         }
     }
-}
-
-/// 创建一个带 channel 的 OSD 接收器
-pub fn create_osd_receiver() -> (impl FnMut(&OsdPlot), mpsc::UnboundedReceiver<OsdPlot>) {
-    let (tx, rx) = mpsc::unbounded_channel();
-    let callback = move |osd: &OsdPlot| {
-        let _ = tx.send(osd.clone());
-    };
-    (callback, rx)
 }

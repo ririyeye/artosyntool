@@ -1,200 +1,155 @@
-# Artosyn Debug Service Client (Rust)
+# Artosyn Register Trace Client (Rust)
 
-用于连接 Artosyn 调试服务（ar_dbg_multi_service）并接收 OSD 数据的 Rust 客户端。
+用于连接 Artosyn 寄存器跟踪服务（ar_reg_trace）并采集寄存器数据的 Rust 客户端。
 
 ## 功能
 
-- 连接到 ar_dbg_multi_service (TCP 端口 1234)
-- 发送启动/停止 OSD 命令
-- 接收并解析 OSD 数据（osd_plot_t 结构）
-- **自动检测设备角色（AP/DEV）并使用正确的字段映射**
-- 显示链路状态、SNR、MCS、LDPC 错误等信息
-
-## 设备角色
-
-系统支持两种设备角色，它们使用不同的 OSD 数据内存布局：
-
-### DEV (设备端) 布局
-```
-BR_LOCK:0x04, BR_LDPC_ERR:0x05, BR_SNR:0x06-07
-BR_AGC0-3:0x08-0x0b, BR_CHN:0x18
-SLOT_TX_CHN:0x19, SLOT_RX_CHN:0x1a, SLOT_RX_OPT_CHN:0x1b
-MAIN_AVR_PWR:0x24-25, OPT_AVR_PWR:0x26-27, MCS_VALUE:0x28
-```
-
-### AP (接入点) 布局
-```
-FCH_LOCK:0x0c, SLOT_LOCK:0x0d, SLOT_LDPC_ERR:0x0e-0f
-SLOT_SNR:0x10-11, SLOT_LDPC_AFTER_ERR:0x12-13
-SLOT_AGC0:0x14, SLOT_AGC2:0x15, SLOT_AGC1:0x16, SLOT_AGC3:0x17
-SLOT_RX_OPT_CHN:0x27, MAIN_AVR_PWR:0x30-31
-OPT_AVR_PWR:0x32-33, MCS_VALUE:0x34
-```
+- 连接到 ar_reg_trace 服务 (TCP 端口 12345)
+- 配置要采集的寄存器项（页号、偏移、宽度）
+- 启动/停止采集
+- 查询采集状态
+- 拉取采集数据
+- 持续监控模式
+- **默认采集第一页寄存器**
 
 ## 协议说明
 
 ### 消息格式
 
 ```
-struct ar_dbg_msg {
-    header1: u8,      // 0xff
-    header2: u8,      // 0x5a
-    version: u8,      // 0
-    msg_id: u8,       // 0=SYS, 1=REG, 2=BB, 3=CMR
-    seq_num: u16,     // 序列号
-    msg_len: u32,     // payload 长度
-    header_sum: u8,   // 头部校验和
-    checksum: u16,    // payload 校验和
-    payload: [u8],    // 数据
+struct reg_trace_msg {
+    magic[2]: [u8; 2],    // 0xBB 0xAC
+    version: u8,          // 协议版本 (0x01)
+    cmd_id: u8,           // 命令ID
+    seq_num: u16,         // 序列号 (小端)
+    payload_len: u16,     // 负载长度 (小端)
+    payload: [u8],        // 负载数据
 }
 ```
 
-### BB 消息格式
+### 命令 ID
 
-发送（请求）:
+| 命令 | ID | 说明 |
+|------|-----|------|
+| Config | 0xB0 | 配置抓取项 |
+| Start | 0xB1 | 启动抓取 |
+| Stop | 0xB2 | 停止抓取 |
+| QueryStatus | 0xB3 | 查询缓冲区状态 |
+| FetchData | 0xB4 | 拉取数据 |
+| ClearBuffer | 0xB5 | 清空缓冲区 |
+| GetVersion | 0xB8 | 获取版本信息 |
+| Ping | 0xB9 | 心跳检测 |
+
+### 配置项结构
+
+每个配置项 4 字节:
 ```
-struct bb_msg_header {
-    bb_msg_id: u8,    // 命令 ID (如 GET_OSD_INFO = 0x01)
-    payload: [u8],    // 命令参数
+struct reg_trace_item {
+    page: u8,      // 寄存器页号 (0-5)
+    offset: u8,    // 页内偏移地址
+    width: u8,     // 读取宽度: 1/2/4 字节
+    reserved: u8,  // 保留
 }
 ```
 
-接收（响应）:
+### 采集记录结构
+
 ```
-struct bb_rcv_msg_header {
-    bb_msg_id: u8,    // 命令 ID
-    ret_type: u8,     // 返回类型
-    payload: [u8],    // OSD 数据
+struct trace_record {
+    timestamp_us: u32,    // 时间戳(微秒)
+    seq_id: u32,          // 记录序列号
+    values: [u32],        // 寄存器值数组
 }
 ```
-
-### OSD 命令
-
-- 获取设备信息: `bb_msg_id=0x02` (返回角色: 0=DEV, 1=AP)
-- 启动 OSD: `bb_msg_id=0x01, payload=[0x01, cycle_cnt, user_id]`
-- 停止 OSD: `bb_msg_id=0x01, payload=[0x00, 0x00, 0x00]`
 
 ## 编译
 
 ```bash
-cd tools/ar_dbg_client
+cd ar_dbg_client
 cargo build --release
 ```
 
 ## 使用
 
 ```bash
-# 默认连接并自动检测设备角色
-./target/release/ar_dbg_client -H 192.168.1.100
+# 心跳测试
+./target/release/ar_dbg_client -H 192.168.1.100 ping
 
-# 强制使用 AP 角色
-./target/release/ar_dbg_client --role ap
+# 获取版本
+./target/release/ar_dbg_client -H 192.168.1.100 version
 
-# 强制使用 DEV 角色
-./target/release/ar_dbg_client --role dev
+# 配置抓取项（第一页，偏移0和4，各4字节）
+./target/release/ar_dbg_client -H 192.168.1.100 config "0,0x00,4;0,0x04,4"
 
-# 调试模式（显示原始 hex dump）
-./target/release/ar_dbg_client -d
+# 使用默认配置（第一页前4个寄存器）
+./target/release/ar_dbg_client -H 192.168.1.100 config
+
+# 启动采集（清空缓冲区）
+./target/release/ar_dbg_client -H 192.168.1.100 start --clear
+
+# 查询状态
+./target/release/ar_dbg_client -H 192.168.1.100 status
+
+# 拉取数据
+./target/release/ar_dbg_client -H 192.168.1.100 fetch --count 20
+
+# 停止采集
+./target/release/ar_dbg_client -H 192.168.1.100 stop
+
+# 持续监控模式（自动配置、启动、持续拉取）
+./target/release/ar_dbg_client -H 192.168.1.100 monitor --interval 1000
+
+# 快速开始（配置默认第一页并启动）
+./target/release/ar_dbg_client -H 192.168.1.100 quick-start
 
 # 详细输出
-./target/release/ar_dbg_client -v
-
-# 原始数据模式
-./target/release/ar_dbg_client -r
-
-# 每5秒显示一次摘要
-./target/release/ar_dbg_client -s 5
+./target/release/ar_dbg_client -H 192.168.1.100 -v status
 ```
 
-### Web 界面模式
+## 命令行参数
 
-```bash
-# 启动带 Web 界面的客户端（默认 8080 端口）
-./target/release/ar_dbg_web -H 192.168.1.100
+```
+Usage: ar_dbg_client [OPTIONS] <COMMAND>
 
-# 指定 Web 端口
-./target/release/ar_dbg_web -H 192.168.1.100 -w 3000
+Commands:
+  ping         心跳检测
+  version      获取版本信息
+  config       配置抓取项
+  start        启动采集
+  stop         停止采集
+  status       查询状态
+  fetch        拉取数据
+  clear        清空缓冲区
+  monitor      持续监控模式
+  quick-start  快速开始（默认配置启动）
 
-# 强制指定设备角色
-./target/release/ar_dbg_web -H 192.168.1.100 --role ap
+Options:
+  -H, --host <HOST>        目标主机 IP [default: 192.168.1.100]
+  -p, --port <PORT>        目标端口 [default: 12345]
+  -t, --timeout <TIMEOUT>  超时时间秒 [default: 5]
+  -v, --verbose            详细输出
+  -h, --help               显示帮助
 ```
 
-然后在浏览器中打开 http://localhost:8080 查看实时曲线图。
+## 配置项格式
 
-#### Web 界面功能
-- 📈 SNR 信噪比实时曲线
-- ⚠️ LDPC 错误实时曲线
-- ⚡ 功率曲线（Main/Opt）
-- 📊 MCS 值变化曲线
-- 🎚️ AGC 增益柱状图（实时）
-- 📋 实时数值面板
-- 🔒 锁定状态指示
-- 支持暂停/继续、清除数据
-- 可调节显示时间范围（30秒-5分钟）
+配置字符串格式: `page,offset,width;page,offset,width;...`
 
-### 参数说明
+- `page`: 寄存器页号 (0-5)
+- `offset`: 页内偏移，支持十六进制 (0x00-0xFF)
+- `width`: 读取宽度 (1, 2, 4)
 
-| 参数 | 说明 | 默认值 |
-|------|------|--------|
-| `-H, --host` | 目标 IP 地址 | 192.168.1.100 |
-| `-p, --port` | 目标端口 | 1234 |
-| `--role` | 强制设备角色 (ap/dev) | 自动检测 |
-| `-d, --debug` | 调试模式（显示 hex dump） | false |
-| `-v, --verbose` | 详细输出 | false |
-| `-r, --raw` | 原始数据格式 | false |
-| `-s, --summary-interval` | 摘要间隔（秒，0=实时） | 0 |
+示例:
+- `"0,0x00,4"` - 页0，偏移0，4字节
+- `"0,0x00,4;0,0x04,4"` - 两个配置项
+- `"1,0x10,4;4,0xDC,4"` - 页1偏移0x10 和 页4偏移0xDC
 
-### Web 版本参数
+## 默认配置
 
-| 参数 | 说明 | 默认值 |
-|------|------|--------|
-| `-H, --host` | 目标 IP 地址 | 192.168.1.100 |
-| `-p, --port` | 目标端口 | 1234 |
-| `-w, --web-port` | Web 服务器端口 | 8080 |
-| `--role` | 强制设备角色 (ap/dev) | 自动检测 |
-| `-v, --verbose` | 详细输出 | false |
-| `-d, --debug` | 调试模式 | false |
+如果不指定配置项，将使用默认配置：
+- 页0，偏移 0x00，4字节
+- 页0，偏移 0x04，4字节
+- 页0，偏移 0x08，4字节
+- 页0，偏移 0x0C，4字节
 
-## 示例输出
-
-### DEV 模式
-```
-=== OSD Data (DEV) ===
-BR_LOCK: 1 (Locked) | MCS: 7
-BR_SNR: 1408 (22.0 dB) | BR_LDPC_ERR: 0
-BR_AGC: [45, 46, 45, 47]
-Channels: BR=36 SLOT_TX=44 SLOT_RX=44 SLOT_OPT=2
-Power: MAIN_AVR=1000 OPT_AVR=800
-```
-
-### AP 模式
-```
-=== OSD Data (AP) ===
-FCH_LOCK: 1 | SLOT_LOCK: 1 (Locked) | MCS: 7
-SLOT_SNR: 1600 (24.0 dB) | SLOT_LDPC_ERR: 0 | AFTER_ERR: 0
-SLOT_AGC: [50, 51, 52, 53]
-SLOT_RX_OPT_CHN: 3
-Power: MAIN_AVR=1200 OPT_AVR=900
-```
-
-## 作为库使用
-
-```rust
-use ar_dbg_client::{ArDbgClient, ClientConfig, DeviceRole};
-use ar_dbg_client::osd::set_device_role;
-
-#[tokio::main]
-async fn main() {
-    let config = ClientConfig {
-        host: "192.168.1.100".to_string(),
-        port: 1234,
-    };
-    
-    let client = ArDbgClient::new(config);
-    
-    // 自动检测角色并启动 OSD 流
-    client.start_osd_stream_auto_role(|osd| {
-        println!("Role: {:?}, SNR: {:.1} dB", osd.role, osd.snr_db());
-    }).await.unwrap();
-}
-```
+这对应于第一页的前16个字节（4个32位寄存器）。

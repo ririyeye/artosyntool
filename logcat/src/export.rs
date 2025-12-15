@@ -1,13 +1,13 @@
+//! 导出 rslog 数据到 CSV 和 JSON
+
 use std::fs::{create_dir_all, File};
 use std::io::{BufWriter, Write};
 
 use anyhow::{Context, Result};
-use ar_dbg_client::osd::set_device_role;
-use ar_dbg_client::{DeviceRole, OsdPlot};
 use rslog::StreamLog;
 use tracing::{info, warn};
 
-use crate::osd_meta::{apply_role_from_payload, build_osd_descriptor, osd_fields, OsdDescriptor};
+use crate::reg_meta::RegTraceDescriptor;
 
 pub struct ExportOptions<'a> {
     pub input: &'a str,
@@ -26,27 +26,28 @@ pub fn run_export(opts: ExportOptions<'_>) -> Result<()> {
     }
 
     let logcat_path = format!("{}/ar_logcat.txt", opts.output_dir);
-    let osd_csv_path = format!("{}/osd.csv", opts.output_dir);
-    let osd_desc_path = format!("{}/osd_descriptor.json", opts.output_dir);
+    let reg_csv_path = format!("{}/reg_trace.csv", opts.output_dir);
+    let reg_desc_path = format!("{}/reg_descriptor.json", opts.output_dir);
 
     let mut logcat_writer = BufWriter::new(
         File::create(&logcat_path).with_context(|| format!("create {}", logcat_path))?,
     );
-    let mut osd_writer = BufWriter::new(
-        File::create(&osd_csv_path).with_context(|| format!("create {}", osd_csv_path))?,
+    let mut reg_writer = BufWriter::new(
+        File::create(&reg_csv_path).with_context(|| format!("create {}", reg_csv_path))?,
     );
-    let mut osd_desc_writer = BufWriter::new(
-        File::create(&osd_desc_path).with_context(|| format!("create {}", osd_desc_path))?,
+    let mut reg_desc_writer = BufWriter::new(
+        File::create(&reg_desc_path).with_context(|| format!("create {}", reg_desc_path))?,
     );
 
-    let mut osd_descriptor: Option<OsdDescriptor> = None;
-    let mut osd_header_written = false;
-    let mut osd_rows: u64 = 0;
+    let mut reg_descriptor: Option<RegTraceDescriptor> = None;
+    let mut reg_header_written = false;
+    let mut reg_rows: u64 = 0;
     let mut logcat_rows: u64 = 0;
 
     for entry in entries {
         match entry.channel() {
             0 => {
+                // 通道0: logcat 文本
                 if let Some(text) = entry.as_text() {
                     writeln!(logcat_writer, "[{}] {}", entry.timestamp_ms, text)?;
                     logcat_rows += 1;
@@ -62,11 +63,13 @@ pub fn run_export(opts: ExportOptions<'_>) -> Result<()> {
                 }
             }
             1 => {
+                // 通道1: 寄存器数据
                 if entry.is_text() {
-                    if osd_descriptor.is_none() {
+                    // 文本记录是 descriptor JSON
+                    if reg_descriptor.is_none() {
                         if let Some(text) = entry.as_text() {
-                            if let Ok(desc) = serde_json::from_str::<OsdDescriptor>(&text) {
-                                osd_descriptor = Some(desc);
+                            if let Ok(desc) = serde_json::from_str::<RegTraceDescriptor>(&text) {
+                                reg_descriptor = Some(desc);
                             }
                         }
                     }
@@ -77,256 +80,75 @@ pub fn run_export(opts: ExportOptions<'_>) -> Result<()> {
                     continue;
                 };
 
-                // 尝试解析批量格式: 多条 [ts:8B][role:1B][raw_data] 连续存储
-                let records = decode_osd_batch(&data, osd_descriptor.as_ref());
+                // 解析批量记录
+                let records = decode_reg_batch(&data, reg_descriptor.as_ref());
 
                 if records.is_empty() {
-                    // 回退到单条解析
-                    match decode_osd_payload(&data, osd_descriptor.as_ref()) {
-                        Some((ts, role, osd)) => {
-                            if osd_descriptor.is_none() {
-                                osd_descriptor = Some(build_osd_descriptor(role));
+                    warn!(
+                        "logcat export: failed to parse reg payload len={}",
+                        data.len()
+                    );
+                    continue;
+                }
+
+                for (ts, seq_id, values) in records {
+                    // 写入 CSV 表头
+                    if !reg_header_written {
+                        let mut header = vec!["timestamp".to_string(), "seq_id".to_string()];
+                        if let Some(ref desc) = reg_descriptor {
+                            header.extend(desc.field_names());
+                        } else {
+                            // 没有 descriptor，使用默认字段名
+                            for i in 0..values.len() {
+                                header.push(format!("reg_{}", i));
                             }
-
-                            if !osd_header_written {
-                                let mut header = Vec::with_capacity(osd_fields(role).len() + 1);
-                                header.push("timestamp".to_string());
-                                header.extend(osd_fields(role).iter().map(|s| (*s).to_string()));
-                                writeln!(osd_writer, "{}", header.join(","))?;
-                                osd_header_written = true;
-                            }
-
-                            let row = format_osd_row(ts, role, &osd);
-                            writeln!(osd_writer, "{}", row)?;
-                            osd_rows += 1;
                         }
-                        None => {
-                            warn!(
-                                "logcat export: failed to parse OSD payload len={}",
-                                data.len()
-                            );
-                        }
+                        writeln!(reg_writer, "{}", header.join(","))?;
+                        reg_header_written = true;
                     }
-                } else {
-                    for (ts, role, osd) in records {
-                        if osd_descriptor.is_none() {
-                            osd_descriptor = Some(build_osd_descriptor(role));
-                        }
 
-                        if !osd_header_written {
-                            let mut header = Vec::with_capacity(osd_fields(role).len() + 1);
-                            header.push("timestamp".to_string());
-                            header.extend(osd_fields(role).iter().map(|s| (*s).to_string()));
-                            writeln!(osd_writer, "{}", header.join(","))?;
-                            osd_header_written = true;
-                        }
-
-                        let row = format_osd_row(ts, role, &osd);
-                        writeln!(osd_writer, "{}", row)?;
-                        osd_rows += 1;
-                    }
+                    // 写入 CSV 行
+                    let row = format_reg_row(ts, seq_id, &values);
+                    writeln!(reg_writer, "{}", row)?;
+                    reg_rows += 1;
                 }
             }
             _ => {}
         }
     }
 
-    if let Some(desc) = osd_descriptor {
+    // 写入 descriptor JSON
+    if let Some(desc) = reg_descriptor {
         let json = serde_json::to_string_pretty(&desc)?;
-        osd_desc_writer.write_all(json.as_bytes())?;
+        reg_desc_writer.write_all(json.as_bytes())?;
     }
 
     logcat_writer.flush()?;
-    osd_writer.flush()?;
-    osd_desc_writer.flush()?;
+    reg_writer.flush()?;
+    reg_desc_writer.flush()?;
 
     info!(
-        "logcat export: saved {} logcat lines to {}, {} OSD rows to {}",
-        logcat_rows, logcat_path, osd_rows, osd_csv_path
+        "logcat export: saved {} logcat lines to {}, {} reg rows to {}",
+        logcat_rows, logcat_path, reg_rows, reg_csv_path
     );
 
     Ok(())
 }
 
-fn role_from_str(value: &str) -> DeviceRole {
-    match value.trim().to_ascii_uppercase().as_str() {
-        "AP" => DeviceRole::Ap,
-        _ => DeviceRole::Dev,
-    }
-}
-
-fn role_from_byte(b: u8) -> DeviceRole {
-    match b {
-        1 => DeviceRole::Ap,
-        _ => DeviceRole::Dev,
-    }
-}
-
-/// 解析批量 OSD 数据: 多条 [ts:8B][role:1B][len:2B][raw_data] 连续存储
-/// 兼容旧格式: [ts:8B][role:1B][raw_data] (固定MIN_SIZE长度)
-fn decode_osd_batch(data: &[u8], _desc: Option<&OsdDescriptor>) -> Vec<(u64, DeviceRole, OsdPlot)> {
+/// 解析批量寄存器数据: 多条 [ts:8B][seq_id:4B][values:N*4B] 连续存储
+fn decode_reg_batch(data: &[u8], desc: Option<&RegTraceDescriptor>) -> Vec<(u64, u32, Vec<u32>)> {
     let mut results = Vec::new();
 
-    // 批量格式最小记录大小: 8(ts) + 1(role) + 2(len) + DEV_MIN_SIZE
-    let min_record_size = 8 + 1 + 2 + OsdPlot::DEV_MIN_SIZE;
+    // 确定每条记录的 values 数量
+    let item_count = desc.map(|d| d.fields.len()).unwrap_or(4);
 
-    // 检查是否可能是批量格式（数据足够大且以合理时间戳开头）
-    if data.len() < min_record_size {
-        return results;
+    // 每条记录大小: ts(8) + seq_id(4) + values(item_count * 4)
+    let record_size = 8 + 4 + item_count * 4;
+
+    if data.len() < record_size {
+        // 数据太短，尝试检测 item_count
+        return decode_reg_batch_auto_detect(data);
     }
-
-    // 尝试读取第一个时间戳，检查是否合理（2020年以后的毫秒时间戳）
-    let first_ts = u64::from_le_bytes([
-        data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-    ]);
-    // 2020-01-01 00:00:00 UTC in ms
-    const MIN_REASONABLE_TS: u64 = 1577836800000;
-    // 2100-01-01 00:00:00 UTC in ms
-    const MAX_REASONABLE_TS: u64 = 4102444800000;
-
-    if first_ts < MIN_REASONABLE_TS || first_ts > MAX_REASONABLE_TS {
-        return results;
-    }
-
-    // 先尝试新格式（带长度字段）
-    if let Some(records) = decode_osd_batch_with_len(data) {
-        return records;
-    }
-
-    // 回退到旧格式（固定MIN_SIZE）
-    decode_osd_batch_fixed_size(data)
-}
-
-/// 新批量格式解析: [ts:8B][role:1B][len:2B][raw_data:len字节]
-fn decode_osd_batch_with_len(data: &[u8]) -> Option<Vec<(u64, DeviceRole, OsdPlot)>> {
-    let mut results = Vec::new();
-    const MIN_REASONABLE_TS: u64 = 1577836800000;
-    const MAX_REASONABLE_TS: u64 = 4102444800000;
-
-    // 最小头部: ts(8) + role(1) + len(2) = 11
-    if data.len() < 11 {
-        return None;
-    }
-
-    let mut offset = 0;
-    while offset + 11 <= data.len() {
-        // 读取时间戳
-        let ts = u64::from_le_bytes([
-            data[offset],
-            data[offset + 1],
-            data[offset + 2],
-            data[offset + 3],
-            data[offset + 4],
-            data[offset + 5],
-            data[offset + 6],
-            data[offset + 7],
-        ]);
-
-        if ts < MIN_REASONABLE_TS || ts > MAX_REASONABLE_TS {
-            break;
-        }
-
-        // 读取角色
-        let role_byte = data[offset + 8];
-        if role_byte > 1 {
-            break;
-        }
-        let role = role_from_byte(role_byte);
-
-        // 读取长度
-        let raw_len = u16::from_le_bytes([data[offset + 9], data[offset + 10]]) as usize;
-
-        // 合理性检查：raw_data 长度应该在 MIN_SIZE 到 256 之间
-        let min_size = match role {
-            DeviceRole::Ap => OsdPlot::AP_MIN_SIZE,
-            DeviceRole::Dev => OsdPlot::DEV_MIN_SIZE,
-        };
-        if raw_len < min_size || raw_len > 256 {
-            // 长度不合理，可能是旧格式
-            return None;
-        }
-
-        let record_end = offset + 11 + raw_len;
-        if record_end > data.len() {
-            break;
-        }
-
-        // 解析 OSD 数据
-        let raw_data = &data[offset + 11..record_end];
-        set_device_role(role);
-        if let Some(osd) = OsdPlot::from_bytes(raw_data) {
-            results.push((ts, role, osd));
-        } else {
-            break;
-        }
-
-        offset = record_end;
-    }
-
-    if results.is_empty() {
-        None
-    } else {
-        Some(results)
-    }
-}
-
-/// 旧批量格式解析: [ts:8B][role:1B][raw_data]
-/// 通过搜索下一个有效时间戳来检测记录大小
-fn decode_osd_batch_fixed_size(data: &[u8]) -> Vec<(u64, DeviceRole, OsdPlot)> {
-    let mut results = Vec::new();
-    const MIN_REASONABLE_TS: u64 = 1577836800000;
-    const MAX_REASONABLE_TS: u64 = 4102444800000;
-
-    let min_record_size = 8 + 1 + OsdPlot::DEV_MIN_SIZE;
-    if data.len() < min_record_size {
-        return results;
-    }
-
-    // 读取第一条记录信息
-    let first_ts = u64::from_le_bytes([
-        data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-    ]);
-    if first_ts < MIN_REASONABLE_TS || first_ts > MAX_REASONABLE_TS {
-        return results;
-    }
-
-    let role_byte = data[8];
-    if role_byte > 1 {
-        return results;
-    }
-    let role = role_from_byte(role_byte);
-
-    // 通过搜索下一个有效时间戳来检测 raw_data 大小
-    let min_raw_size = match role {
-        DeviceRole::Ap => OsdPlot::AP_MIN_SIZE,
-        DeviceRole::Dev => OsdPlot::DEV_MIN_SIZE,
-    };
-    let max_raw_size = 128; // 合理的最大值
-
-    let mut detected_raw_size = min_raw_size;
-    for try_size in min_raw_size..=max_raw_size {
-        let next_offset = 9 + try_size; // 9 = ts(8) + role(1)
-        if next_offset + 9 > data.len() {
-            break;
-        }
-        let next_ts = u64::from_le_bytes([
-            data[next_offset],
-            data[next_offset + 1],
-            data[next_offset + 2],
-            data[next_offset + 3],
-            data[next_offset + 4],
-            data[next_offset + 5],
-            data[next_offset + 6],
-            data[next_offset + 7],
-        ]);
-        let next_role = data[next_offset + 8];
-        if next_ts >= MIN_REASONABLE_TS && next_ts <= MAX_REASONABLE_TS && next_role <= 1 {
-            detected_raw_size = try_size;
-            break;
-        }
-    }
-
-    let record_size = 9 + detected_raw_size;
 
     let mut offset = 0;
     while offset + record_size <= data.len() {
@@ -342,175 +164,190 @@ fn decode_osd_batch_fixed_size(data: &[u8]) -> Vec<(u64, DeviceRole, OsdPlot)> {
             data[offset + 7],
         ]);
 
+        // 合理性检查时间戳 (2020年以后的毫秒时间戳)
+        const MIN_REASONABLE_TS: u64 = 1577836800000;
+        const MAX_REASONABLE_TS: u64 = 4102444800000;
         if ts < MIN_REASONABLE_TS || ts > MAX_REASONABLE_TS {
             break;
         }
 
-        // 读取角色
-        let role_byte = data[offset + 8];
-        if role_byte > 1 {
-            break;
-        }
-        let role = role_from_byte(role_byte);
+        // 读取 seq_id
+        let seq_id = u32::from_le_bytes([
+            data[offset + 8],
+            data[offset + 9],
+            data[offset + 10],
+            data[offset + 11],
+        ]);
 
-        // 解析 OSD 数据
-        let raw_data = &data[offset + 9..offset + 9 + detected_raw_size];
-        set_device_role(role);
-        if let Some(osd) = OsdPlot::from_bytes(raw_data) {
-            results.push((ts, role, osd));
-        } else {
-            break;
+        // 读取 values
+        let mut values = Vec::with_capacity(item_count);
+        for i in 0..item_count {
+            let v_offset = offset + 12 + i * 4;
+            if v_offset + 4 <= data.len() {
+                values.push(u32::from_le_bytes([
+                    data[v_offset],
+                    data[v_offset + 1],
+                    data[v_offset + 2],
+                    data[v_offset + 3],
+                ]));
+            }
         }
 
+        results.push((ts, seq_id, values));
         offset += record_size;
     }
 
     results
 }
 
-fn decode_osd_payload(
-    data: &[u8],
-    desc: Option<&OsdDescriptor>,
-) -> Option<(u64, DeviceRole, OsdPlot)> {
-    // 优先使用 descriptor 提供的角色
-    if let Some(d) = desc {
-        let role = role_from_str(&d.role);
-        set_device_role(role);
+/// 自动检测 item_count 并解析
+fn decode_reg_batch_auto_detect(data: &[u8]) -> Vec<(u64, u32, Vec<u32>)> {
+    let mut results = Vec::new();
 
-        // 如果数据是 [role|raw] 格式，去掉前缀
-        let payload = if data.len() > OsdPlot::DEV_MIN_SIZE && (data[0] == 0 || data[0] == 1) {
-            &data[1..]
-        } else {
-            data
-        };
+    const MIN_REASONABLE_TS: u64 = 1577836800000;
+    const MAX_REASONABLE_TS: u64 = 4102444800000;
 
-        if let Some(osd) = OsdPlot::from_bytes(payload) {
-            return Some((0, role, osd));
+    // 最小记录: ts(8) + seq_id(4) + 至少1个value(4) = 16
+    if data.len() < 16 {
+        return results;
+    }
+
+    // 检查第一个时间戳
+    let first_ts = u64::from_le_bytes([
+        data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+    ]);
+    if first_ts < MIN_REASONABLE_TS || first_ts > MAX_REASONABLE_TS {
+        return results;
+    }
+
+    // 尝试检测 item_count (1-16)
+    for item_count in 1..=16 {
+        let record_size = 8 + 4 + item_count * 4;
+
+        // 检查是否能整除
+        if data.len() % record_size != 0 {
+            continue;
+        }
+
+        // 检查第二条记录的时间戳
+        if data.len() >= record_size * 2 {
+            let second_ts = u64::from_le_bytes([
+                data[record_size],
+                data[record_size + 1],
+                data[record_size + 2],
+                data[record_size + 3],
+                data[record_size + 4],
+                data[record_size + 5],
+                data[record_size + 6],
+                data[record_size + 7],
+            ]);
+            if second_ts < MIN_REASONABLE_TS || second_ts > MAX_REASONABLE_TS {
+                continue;
+            }
+        }
+
+        // 找到匹配的 item_count，解析所有记录
+        let mut offset = 0;
+        while offset + record_size <= data.len() {
+            let ts = u64::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+                data[offset + 4],
+                data[offset + 5],
+                data[offset + 6],
+                data[offset + 7],
+            ]);
+
+            if ts < MIN_REASONABLE_TS || ts > MAX_REASONABLE_TS {
+                break;
+            }
+
+            let seq_id = u32::from_le_bytes([
+                data[offset + 8],
+                data[offset + 9],
+                data[offset + 10],
+                data[offset + 11],
+            ]);
+
+            let mut values = Vec::with_capacity(item_count);
+            for i in 0..item_count {
+                let v_offset = offset + 12 + i * 4;
+                values.push(u32::from_le_bytes([
+                    data[v_offset],
+                    data[v_offset + 1],
+                    data[v_offset + 2],
+                    data[v_offset + 3],
+                ]));
+            }
+
+            results.push((ts, seq_id, values));
+            offset += record_size;
+        }
+
+        if !results.is_empty() {
+            return results;
         }
     }
 
-    // 尝试 role + raw 格式
-    if data.len() > OsdPlot::DEV_MIN_SIZE && (data[0] == 0 || data[0] == 1) {
-        let role = role_from_byte(data[0]);
-        let payload = &data[1..];
-        set_device_role(role);
-        if let Some(osd) = OsdPlot::from_bytes(payload) {
-            return Some((0, role, osd));
-        }
-    }
-
-    // 尝试直接原始 OSD 数据（无前缀）
-    if data.len() >= OsdPlot::DEV_MIN_SIZE {
-        let role = apply_role_from_payload(data);
-        if let Some(osd) = OsdPlot::from_bytes(data) {
-            return Some((0, role, osd));
-        }
-    }
-
-    // 回退: 兼容旧的紧凑 31B 格式 (role + fields)
-    if data.len() == 31 {
-        return parse_compact_osd(data).map(|(role, osd)| (0, role, osd));
-    }
-
-    None
+    results
 }
 
-fn parse_compact_osd(data: &[u8]) -> Option<(DeviceRole, OsdPlot)> {
-    if data.len() != 31 {
-        return None;
-    }
-    let role = role_from_byte(data[0]);
-    let mut osd = OsdPlot::default();
-    osd.role = role;
-    osd.raw_data = Vec::new();
+/// 格式化 CSV 行
+fn format_reg_row(ts: u64, seq_id: u32, values: &[u32]) -> String {
+    let mut fields = Vec::with_capacity(2 + values.len());
 
-    // layout matches osd_to_bytes (old version): role + DEV + AP + common
-    let mut idx = 1;
-
-    // DEV
-    osd.br_lock = data[idx];
-    idx += 1;
-    osd.br_ldpc_error = data[idx];
-    idx += 1;
-    osd.br_snr_value = u16::from_le_bytes([data[idx], data[idx + 1]]);
-    idx += 2;
-    osd.br_agc_value = [data[idx], data[idx + 1], data[idx + 2], data[idx + 3]];
-    idx += 4;
-    osd.br_channel = data[idx];
-    idx += 1;
-    osd.slot_tx_channel = data[idx];
-    idx += 1;
-    osd.slot_rx_channel = data[idx];
-    idx += 1;
-    osd.slot_rx_opt_channel = data[idx];
-    idx += 1;
-
-    // AP
-    osd.fch_lock = data[idx];
-    idx += 1;
-    osd.slot_lock = data[idx];
-    idx += 1;
-    osd.slot_ldpc_error = u16::from_le_bytes([data[idx], data[idx + 1]]);
-    idx += 2;
-    osd.slot_snr_value = u16::from_le_bytes([data[idx], data[idx + 1]]);
-    idx += 2;
-    osd.slot_ldpc_after_error = u16::from_le_bytes([data[idx], data[idx + 1]]);
-    idx += 2;
-    osd.slot_agc_value = [data[idx], data[idx + 1], data[idx + 2], data[idx + 3]];
-    idx += 4;
-
-    // common
-    osd.main_avr_pwr = u16::from_le_bytes([data[idx], data[idx + 1]]);
-    idx += 2;
-    osd.opt_avr_pwr = u16::from_le_bytes([data[idx], data[idx + 1]]);
-    idx += 2;
-    osd.mcs_value = data[idx];
-
-    Some((role, osd))
-}
-
-fn format_osd_row(ts: u64, role: DeviceRole, osd: &OsdPlot) -> String {
-    let mut fields = Vec::new();
     // 将毫秒时间戳转换为秒（浮点数），PlotJuggler 更好识别
     let ts_sec = ts as f64 / 1000.0;
     fields.push(format!("{:.3}", ts_sec));
-    match role {
-        DeviceRole::Dev => {
-            // role_id: DEV=0
-            fields.push("0".to_string());
-            fields.push(osd.br_lock.to_string());
-            fields.push(osd.br_ldpc_error.to_string());
-            fields.push(osd.br_snr_value.to_string());
-            fields.push(osd.br_agc_value[0].to_string());
-            fields.push(osd.br_agc_value[1].to_string());
-            fields.push(osd.br_agc_value[2].to_string());
-            fields.push(osd.br_agc_value[3].to_string());
-            fields.push(osd.br_channel.to_string());
-            fields.push(osd.slot_tx_channel.to_string());
-            fields.push(osd.slot_rx_channel.to_string());
-            fields.push(osd.slot_rx_opt_channel.to_string());
-            fields.push(osd.main_avr_pwr.to_string());
-            fields.push(osd.opt_avr_pwr.to_string());
-            fields.push(osd.mcs_value.to_string());
-        }
-        DeviceRole::Ap => {
-            // role_id: AP=1
-            fields.push("1".to_string());
-            fields.push(osd.fch_lock.to_string());
-            fields.push(osd.slot_lock.to_string());
-            fields.push(osd.slot_ldpc_error.to_string());
-            fields.push(osd.slot_snr_value.to_string());
-            fields.push(osd.slot_ldpc_after_error.to_string());
-            fields.push(osd.slot_agc_value[0].to_string());
-            fields.push(osd.slot_agc_value[1].to_string());
-            fields.push(osd.slot_agc_value[2].to_string());
-            fields.push(osd.slot_agc_value[3].to_string());
-            fields.push(osd.slot_rx_opt_channel.to_string());
-            fields.push(osd.main_avr_pwr.to_string());
-            fields.push(osd.opt_avr_pwr.to_string());
-            fields.push(osd.mcs_value.to_string());
-        }
+    fields.push(seq_id.to_string());
+
+    for v in values {
+        fields.push(v.to_string());
     }
 
     fields.join(",")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_decode_reg_batch() {
+        // 构造测试数据: 2条记录，每条4个values
+        let mut data = Vec::new();
+
+        // 记录1
+        let ts1: u64 = 1700000000000; // 2023年
+        let seq1: u32 = 0;
+        let values1: [u32; 4] = [0x1234, 0x5678, 0x9ABC, 0xDEF0];
+
+        data.extend_from_slice(&ts1.to_le_bytes());
+        data.extend_from_slice(&seq1.to_le_bytes());
+        for v in &values1 {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+
+        // 记录2
+        let ts2: u64 = 1700000001000;
+        let seq2: u32 = 1;
+        let values2: [u32; 4] = [0x1111, 0x2222, 0x3333, 0x4444];
+
+        data.extend_from_slice(&ts2.to_le_bytes());
+        data.extend_from_slice(&seq2.to_le_bytes());
+        for v in &values2 {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+
+        let records = decode_reg_batch_auto_detect(&data);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].0, ts1);
+        assert_eq!(records[0].1, seq1);
+        assert_eq!(records[0].2, values1.to_vec());
+        assert_eq!(records[1].0, ts2);
+        assert_eq!(records[1].1, seq2);
+        assert_eq!(records[1].2, values2.to_vec());
+    }
 }

@@ -1,0 +1,42 @@
+{
+  "name": "example_regs",
+  "description": "示例寄存器配置",
+  "host": "192.168.1.100",
+  "port": 12345,
+  "sample_div": 1,
+  "buffer_depth": 100,
+  "items": [
+    {
+      "page": 0,
+      "offset": 0,
+      "width": 4,
+      "name": "status_reg",
+      "description": "状态寄存器",
+      "unit": ""
+    },
+    {
+      "page": 0,
+      "offset": 4,
+      "width": 4,
+      "name": "ctrl_reg",
+      "description": "控制寄存器",
+      "unit": ""
+    },
+    {
+      "page": 0,
+      "offset": 8,
+      "width": 4,
+      "name": "counter",
+      "description": "计数器",
+      "unit": "次"
+    },
+    {
+      "page": 1,
+      "offset": 0,
+      "width": 4,
+      "name": "data_reg",
+      "description": "数据寄存器",
+      "unit": ""
+    }
+  ]
+}

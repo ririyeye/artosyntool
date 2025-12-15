@@ -24,9 +24,6 @@ memmap2 = "0.9"
 # 字节序处理
 byteorder = "1.5"
 
-# 命令行解析
-clap = { version = "4.5", features = ["derive"] }
-
 # 时间处理
 chrono = { version = "0.4", default-features = false }
 

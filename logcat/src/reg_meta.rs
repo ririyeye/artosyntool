@@ -1,0 +1,364 @@
+//! 寄存器跟踪配置和元数据
+//!
+//! 支持从 JSON 配置文件读取要采集的寄存器列表
+
+use ar_dbg_client::{ConfigRequest, RegTraceItem, DEFAULT_PORT, MAX_ITEMS};
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::Path;
+
+/// 单个寄存器配置项（JSON 格式）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegItemConfig {
+    /// 寄存器页号 (0-5)
+    pub page: u8,
+    /// 页内偏移地址（支持十六进制字符串如 "0x10"）
+    #[serde(deserialize_with = "deserialize_hex_or_int")]
+    pub offset: u8,
+    /// 读取宽度: 1/2/4 字节
+    #[serde(default = "default_width")]
+    pub width: u8,
+    /// 字段名称（用于 CSV 表头和描述）
+    #[serde(default)]
+    pub name: String,
+    /// 字段描述
+    #[serde(default)]
+    pub description: String,
+    /// 单位
+    #[serde(default)]
+    pub unit: String,
+}
+
+fn default_width() -> u8 {
+    4
+}
+
+/// 自定义反序列化：支持整数或十六进制字符串
+fn deserialize_hex_or_int<'de, D>(deserializer: D) -> Result<u8, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum HexOrInt {
+        Int(u8),
+        Str(String),
+    }
+
+    match HexOrInt::deserialize(deserializer)? {
+        HexOrInt::Int(v) => Ok(v),
+        HexOrInt::Str(s) => {
+            let s = s.trim();
+            if s.starts_with("0x") || s.starts_with("0X") {
+                u8::from_str_radix(&s[2..], 16).map_err(D::Error::custom)
+            } else {
+                s.parse::<u8>().map_err(D::Error::custom)
+            }
+        }
+    }
+}
+
+/// 寄存器跟踪配置（JSON 格式）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegTraceConfig {
+    /// 配置名称
+    #[serde(default)]
+    pub name: String,
+
+    /// 配置描述
+    #[serde(default)]
+    pub description: String,
+
+    /// 目标主机 IP
+    #[serde(default = "default_host")]
+    pub host: String,
+
+    /// 目标端口
+    #[serde(default = "default_port")]
+    pub port: u16,
+
+    /// 采样分频: 1=每帧采集, N=每N帧采集一次
+    #[serde(default = "default_sample_div")]
+    pub sample_div: u8,
+
+    /// 环形缓冲区深度（记录数）
+    #[serde(default = "default_buffer_depth")]
+    pub buffer_depth: u16,
+
+    /// 要采集的寄存器列表
+    pub items: Vec<RegItemConfig>,
+}
+
+fn default_host() -> String {
+    "192.168.1.100".to_string()
+}
+
+fn default_port() -> u16 {
+    DEFAULT_PORT
+}
+
+fn default_sample_div() -> u8 {
+    1
+}
+
+fn default_buffer_depth() -> u16 {
+    100
+}
+
+impl Default for RegTraceConfig {
+    fn default() -> Self {
+        Self {
+            name: "default".to_string(),
+            description: "默认配置：采集第一页前4个32位寄存器".to_string(),
+            host: default_host(),
+            port: default_port(),
+            sample_div: 1,
+            buffer_depth: 100,
+            items: vec![
+                RegItemConfig {
+                    page: 0,
+                    offset: 0x00,
+                    width: 4,
+                    name: "reg_0x00".to_string(),
+                    description: "页0偏移0x00".to_string(),
+                    unit: "".to_string(),
+                },
+                RegItemConfig {
+                    page: 0,
+                    offset: 0x04,
+                    width: 4,
+                    name: "reg_0x04".to_string(),
+                    description: "页0偏移0x04".to_string(),
+                    unit: "".to_string(),
+                },
+                RegItemConfig {
+                    page: 0,
+                    offset: 0x08,
+                    width: 4,
+                    name: "reg_0x08".to_string(),
+                    description: "页0偏移0x08".to_string(),
+                    unit: "".to_string(),
+                },
+                RegItemConfig {
+                    page: 0,
+                    offset: 0x0C,
+                    width: 4,
+                    name: "reg_0x0C".to_string(),
+                    description: "页0偏移0x0C".to_string(),
+                    unit: "".to_string(),
+                },
+            ],
+        }
+    }
+}
+
+impl RegTraceConfig {
+    /// 从 JSON 文件加载配置
+    pub fn from_file<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
+        let content = fs::read_to_string(path.as_ref())?;
+        let config: RegTraceConfig = serde_json::from_str(&content)?;
+
+        // 验证配置
+        if config.items.is_empty() {
+            anyhow::bail!("配置文件中 items 不能为空");
+        }
+        if config.items.len() > MAX_ITEMS {
+            anyhow::bail!("配置项数量超过最大值 {}", MAX_ITEMS);
+        }
+
+        Ok(config)
+    }
+
+    /// 保存配置到 JSON 文件
+    #[allow(dead_code)]
+    pub fn to_file<P: AsRef<Path>>(&self, path: P) -> anyhow::Result<()> {
+        let content = serde_json::to_string_pretty(self)?;
+        fs::write(path, content)?;
+        Ok(())
+    }
+
+    /// 转换为 ar_dbg_client 的 ConfigRequest
+    pub fn to_config_request(&self) -> ConfigRequest {
+        ConfigRequest {
+            items: self
+                .items
+                .iter()
+                .map(|item| RegTraceItem::new(item.page, item.offset, item.width))
+                .collect(),
+            sample_div: self.sample_div,
+            buffer_depth: self.buffer_depth,
+        }
+    }
+
+    /// 获取字段名称列表（用于 CSV 表头）
+    #[allow(dead_code)]
+    pub fn field_names(&self) -> Vec<String> {
+        self.items
+            .iter()
+            .enumerate()
+            .map(|(_i, item)| {
+                if item.name.is_empty() {
+                    format!("reg_p{}_0x{:02X}", item.page, item.offset)
+                } else {
+                    item.name.clone()
+                }
+            })
+            .collect()
+    }
+}
+
+/// 字段描述信息
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FieldInfo {
+    pub name: String,
+    pub page: u8,
+    pub offset: u8,
+    pub width: u8,
+    pub description: String,
+    pub unit: String,
+}
+
+/// 寄存器跟踪描述符（存储在 rslog 通道1 的文本记录，导出为 JSON）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegTraceDescriptor {
+    /// 配置名称
+    pub name: String,
+    /// 配置描述
+    pub description: String,
+    /// 字段列表
+    pub fields: Vec<FieldInfo>,
+    /// 时间戳单位
+    pub timestamp_unit: String,
+    /// PlotJuggler 使用说明
+    pub plotjuggler_notes: String,
+}
+
+impl RegTraceDescriptor {
+    /// 从配置构建描述符
+    pub fn from_config(config: &RegTraceConfig) -> Self {
+        let fields: Vec<FieldInfo> = config
+            .items
+            .iter()
+            .enumerate()
+            .map(|(_i, item)| {
+                let name = if item.name.is_empty() {
+                    format!("reg_p{}_0x{:02X}", item.page, item.offset)
+                } else {
+                    item.name.clone()
+                };
+                FieldInfo {
+                    name,
+                    page: item.page,
+                    offset: item.offset,
+                    width: item.width,
+                    description: item.description.clone(),
+                    unit: item.unit.clone(),
+                }
+            })
+            .collect();
+
+        Self {
+            name: config.name.clone(),
+            description: config.description.clone(),
+            fields,
+            timestamp_unit: "seconds (Unix epoch)".to_string(),
+            plotjuggler_notes: "CSV第一列timestamp为时间轴(秒)，可直接在PlotJuggler中选择作为X轴"
+                .to_string(),
+        }
+    }
+
+    /// 获取字段名称列表
+    pub fn field_names(&self) -> Vec<String> {
+        self.fields.iter().map(|f| f.name.clone()).collect()
+    }
+}
+
+/// 生成示例配置文件内容
+#[allow(dead_code)]
+pub fn generate_example_config() -> String {
+    let config = RegTraceConfig {
+        name: "example".to_string(),
+        description: "示例配置：采集指定寄存器".to_string(),
+        host: "192.168.1.100".to_string(),
+        port: DEFAULT_PORT,
+        sample_div: 1,
+        buffer_depth: 100,
+        items: vec![
+            RegItemConfig {
+                page: 0,
+                offset: 0x00,
+                width: 4,
+                name: "status_reg".to_string(),
+                description: "状态寄存器".to_string(),
+                unit: "".to_string(),
+            },
+            RegItemConfig {
+                page: 0,
+                offset: 0x04,
+                width: 4,
+                name: "ctrl_reg".to_string(),
+                description: "控制寄存器".to_string(),
+                unit: "".to_string(),
+            },
+            RegItemConfig {
+                page: 1,
+                offset: 0x10,
+                width: 4,
+                name: "snr_raw".to_string(),
+                description: "SNR原始值 (dB = 10*log10(value/64))".to_string(),
+                unit: "raw".to_string(),
+            },
+            RegItemConfig {
+                page: 4,
+                offset: 0xDC,
+                width: 4,
+                name: "agc_value".to_string(),
+                description: "AGC增益值".to_string(),
+                unit: "dB".to_string(),
+            },
+        ],
+    };
+    serde_json::to_string_pretty(&config).unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config() {
+        let config = RegTraceConfig::default();
+        assert_eq!(config.items.len(), 4);
+        assert_eq!(config.items[0].page, 0);
+        assert_eq!(config.items[0].offset, 0x00);
+    }
+
+    #[test]
+    fn test_to_config_request() {
+        let config = RegTraceConfig::default();
+        let req = config.to_config_request();
+        assert_eq!(req.items.len(), 4);
+        assert_eq!(req.sample_div, 1);
+    }
+
+    #[test]
+    fn test_json_parse() {
+        let json = r#"{
+            "name": "test",
+            "items": [
+                {"page": 0, "offset": "0x10", "width": 4, "name": "test_reg"}
+            ]
+        }"#;
+        let config: RegTraceConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.items[0].offset, 0x10);
+    }
+
+    #[test]
+    fn test_descriptor() {
+        let config = RegTraceConfig::default();
+        let desc = RegTraceDescriptor::from_config(&config);
+        assert_eq!(desc.fields.len(), 4);
+    }
+}

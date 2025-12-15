@@ -1,15 +1,18 @@
 //! 远程模式: 通过 SSH 远程执行 ar_logcat，同时采集 ar_dbg_client OSD 数据
 
 use anyhow::{anyhow, Result};
-use ar_dbg_client::{ArDbgClient, ClientConfig, OsdPlot};
+use ar_dbg_client::OsdPlot;
+use bytes::BytesMut;
 use rslog::StreamWriter;
 use russh::client;
 use russh::keys::PrivateKeyWithHashAlg;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// OSD 数据通道号
 const OSD_CHANNEL: u8 = 1;
@@ -152,7 +155,7 @@ pub async fn run_remote(
     ssh_result
 }
 
-/// OSD 数据采集（带自动重连）
+/// OSD 数据采集（带自动重连）- 可中断版本
 async fn run_osd_collector(
     host: &str,
     port: u16,
@@ -168,45 +171,105 @@ async fn run_osd_collector(
     let mut reconnect_count = 0u64;
 
     while running.load(Ordering::SeqCst) {
-        let config = ClientConfig {
-            host: host.to_string(),
-            port,
-        };
-        let client = ArDbgClient::new(config);
-
-        // 使用 channel 来接收 OSD 数据
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<OsdPlot>(1000);
-
-        // 启动接收任务
-        let recv_running = running.clone();
-        let recv_task = tokio::spawn(async move {
-            let result = client
-                .start_osd_stream(move |osd: &OsdPlot| {
-                    // 使用 try_send 避免阻塞
-                    if let Err(e) = tx.try_send(osd.clone()) {
-                        // 缓冲区满时忽略，不阻塞
-                        if !matches!(e, tokio::sync::mpsc::error::TrySendError::Full(_)) {
-                            // Channel closed
+        // 尝试连接
+        let addr = format!("{}:{}", host, port);
+        let stream = match TcpStream::connect(&addr).await {
+            Ok(s) => s,
+            Err(e) => {
+                if running.load(Ordering::SeqCst) {
+                    warn!("osd: Connection failed: {}", e);
+                    // 可中断的等待
+                    for _ in 0..OSD_RECONNECT_INTERVAL * 10 {
+                        if !running.load(Ordering::SeqCst) {
+                            info!("osd: Collector stopped during reconnect wait");
+                            return;
                         }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                     }
-                })
-                .await;
-            if recv_running.load(Ordering::SeqCst) {
-                if let Err(e) = result {
-                    warn!("osd: Connection error: {}", e);
                 }
+                continue;
             }
-        });
+        };
 
-        info!("osd: Connected, receiving data...");
+        info!("osd: Connected to {}", addr);
 
-        // 处理接收到的数据
-        loop {
-            tokio::select! {
-                osd = rx.recv() => {
-                    match osd {
-                        Some(osd_data) => {
-                            let data = osd_to_bytes(&osd_data);
+        // 运行 OSD 流接收
+        if let Err(e) = run_osd_stream(stream, &writer, &running, &osd_count).await {
+            if running.load(Ordering::SeqCst) {
+                warn!("osd: Stream error: {}", e);
+            }
+        }
+
+        if !running.load(Ordering::SeqCst) {
+            break;
+        }
+
+        // 重连
+        reconnect_count += 1;
+        warn!(
+            "osd: Connection lost, reconnecting in {}s (attempt #{})",
+            OSD_RECONNECT_INTERVAL, reconnect_count
+        );
+
+        // 可中断的等待
+        for _ in 0..OSD_RECONNECT_INTERVAL * 10 {
+            if !running.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    info!("osd: Collector stopped, {} reconnects", reconnect_count);
+}
+
+/// 运行 OSD 数据流接收（可中断）
+async fn run_osd_stream(
+    mut stream: TcpStream,
+    writer: &Arc<Mutex<StreamWriter>>,
+    running: &Arc<AtomicBool>,
+    osd_count: &Arc<AtomicU64>,
+) -> Result<()> {
+    use ar_dbg_client::protocol::{self, Message, MsgId};
+
+    // 发送启动 OSD 命令
+    let start_msg = protocol::create_start_osd_msg(0);
+    let data = start_msg.encode();
+    stream.write_all(&data).await?;
+    info!("osd: Sent start OSD command");
+
+    let mut buf = BytesMut::with_capacity(8192);
+    let mut read_buf = [0u8; 4096];
+
+    loop {
+        // 每次循环检查停止信号
+        if !running.load(Ordering::SeqCst) {
+            info!("osd: Stopping stream due to signal");
+            // 发送停止 OSD 命令
+            let stop_msg = protocol::create_stop_osd_msg(1);
+            let stop_data = stop_msg.encode();
+            let _ = stream.write_all(&stop_data).await;
+            return Ok(());
+        }
+
+        // 使用带超时的读取，这样可以定期检查停止信号
+        let read_result =
+            tokio::time::timeout(Duration::from_millis(100), stream.read(&mut read_buf)).await;
+
+        match read_result {
+            Ok(Ok(0)) => {
+                warn!("osd: Connection closed by peer");
+                return Err(anyhow!("Connection closed"));
+            }
+            Ok(Ok(n)) => {
+                buf.extend_from_slice(&read_buf[..n]);
+                debug!("osd: Received {} bytes, buffer size: {}", n, buf.len());
+
+                // 解析消息
+                while let Some(msg) = Message::decode(&mut buf)? {
+                    if msg.header.msg_id == MsgId::Baseband {
+                        if let Some(osd) = parse_osd_from_bb_message(&msg) {
+                            let data = osd_to_bytes(&osd);
                             let ts = current_timestamp();
                             {
                                 let mut w = writer.lock().await;
@@ -219,37 +282,35 @@ async fn run_osd_collector(
                                 eprint!("\rosd: {} records", count);
                             }
                         }
-                        None => {
-                            // Channel closed, connection lost
-                            break;
-                        }
-                    }
-                }
-                _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                    if !running.load(Ordering::SeqCst) {
-                        recv_task.abort();
-                        return;
                     }
                 }
             }
+            Ok(Err(e)) => {
+                return Err(anyhow!("Read error: {}", e));
+            }
+            Err(_) => {
+                // 超时，继续循环检查停止信号
+            }
         }
+    }
+}
 
-        recv_task.abort();
+/// 从 BB 消息中解析 OSD 数据
+fn parse_osd_from_bb_message(msg: &ar_dbg_client::protocol::Message) -> Option<OsdPlot> {
+    use ar_dbg_client::protocol::{BbCmd, BbRcvMsgHeader};
 
-        if !running.load(Ordering::SeqCst) {
-            break;
-        }
-
-        // 重连
-        reconnect_count += 1;
-        warn!(
-            "osd: Connection lost, reconnecting in {}s (attempt #{})",
-            OSD_RECONNECT_INTERVAL, reconnect_count
-        );
-        tokio::time::sleep(Duration::from_secs(OSD_RECONNECT_INTERVAL)).await;
+    if msg.payload.len() < 2 {
+        return None;
     }
 
-    info!("osd: Collector stopped, {} reconnects", reconnect_count);
+    let rcv_header = BbRcvMsgHeader::from_bytes(&msg.payload)?;
+
+    if rcv_header.bb_msg_id == BbCmd::GetOsdInfo.to_local_u8() {
+        let osd_data = &msg.payload[2..];
+        OsdPlot::from_bytes_debug(osd_data)
+    } else {
+        None
+    }
 }
 
 /// SSH logcat 采集

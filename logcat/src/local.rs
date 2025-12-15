@@ -4,10 +4,11 @@ use anyhow::Result;
 use rslog::StreamWriter;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
-use tracing::info;
+use tracing::{info, warn};
 
 /// 获取当前时间戳（毫秒）
 fn current_timestamp() -> u64 {
@@ -28,14 +29,23 @@ pub async fn run_local(output: &str, cmd: &str, max_size: u64) -> Result<()> {
     info!("logcat: Flush: every 1000 lines or 10s idle");
     info!("logcat: Press Ctrl+C to stop");
 
+    let running = Arc::new(AtomicBool::new(true));
+    let running_clone = running.clone();
+    tokio::spawn(async move {
+        if let Ok(()) = tokio::signal::ctrl_c().await {
+            info!("logcat: Received Ctrl+C, stopping...");
+            running_clone.store(false, Ordering::SeqCst);
+        }
+    });
+
     // 启动 ar_logcat 进程
-    let child = Command::new("sh")
+    let mut child = Command::new("sh")
         .arg("-c")
         .arg(cmd)
         .stdout(Stdio::piped())
         .spawn()?;
 
-    let stdout = child.stdout.unwrap();
+    let stdout = child.stdout.take().unwrap();
 
     // 使用通道在读取线程和主线程之间传递数据
     let (tx, rx) = mpsc::channel::<String>();
@@ -63,6 +73,9 @@ pub async fn run_local(output: &str, cmd: &str, max_size: u64) -> Result<()> {
     let check_interval = Duration::from_millis(100);
 
     loop {
+        if !running.load(Ordering::SeqCst) {
+            break;
+        }
         match rx.recv_timeout(check_interval) {
             Ok(line) => {
                 last_activity = Instant::now();
@@ -114,6 +127,13 @@ pub async fn run_local(output: &str, cmd: &str, max_size: u64) -> Result<()> {
     writer.sync()?;
 
     let _ = reader_thread.join();
+
+    // 终止子进程
+    if let Err(e) = child.kill() {
+        warn!("Failed to kill child process: {}", e);
+    }
+    let _ = child.wait();
+
     info!(
         "logcat: Done. Total {} lines, {} flushes",
         line_count, flush_count

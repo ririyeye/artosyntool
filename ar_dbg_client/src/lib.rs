@@ -24,9 +24,7 @@
 pub mod client;
 pub mod osd;
 pub mod protocol;
-pub mod web;
 
 pub use client::{ArDbgClient, ClientConfig, ClientError, DEFAULT_PORT};
 pub use osd::{DeviceRole, OsdPlot};
 pub use protocol::{BbCmd, Message, MsgId, OsdConfig};
-pub use web::{start_web_server, OsdWebData, WebState};

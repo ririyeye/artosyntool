@@ -2,3 +2,4 @@ target
 Cargo.lock
 .github/copilot-instructions.md
 .vscode/
+rslog_remote.dat

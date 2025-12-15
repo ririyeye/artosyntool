@@ -804,6 +804,26 @@ impl StreamWriter {
         self.log.write_text(timestamp_ms, text)
     }
 
+    /// 写入文本（指定通道）
+    pub fn write_text_ch(&mut self, channel: u8, timestamp_ms: u64, text: &str) -> io::Result<u64> {
+        self.log.write_text_ch(channel, timestamp_ms, text)
+    }
+
+    /// 写入二进制数据（默认通道0）
+    pub fn write_binary(&mut self, timestamp_ms: u64, data: &[u8]) -> io::Result<u64> {
+        self.log.write_binary(timestamp_ms, data)
+    }
+
+    /// 写入二进制数据（指定通道）
+    pub fn write_binary_ch(
+        &mut self,
+        channel: u8,
+        timestamp_ms: u64,
+        data: &[u8],
+    ) -> io::Result<u64> {
+        self.log.write_binary_ch(channel, timestamp_ms, data)
+    }
+
     pub fn flush(&mut self) -> io::Result<()> {
         self.log.flush()
     }

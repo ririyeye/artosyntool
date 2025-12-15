@@ -1,0 +1,40 @@
+[package]
+name = "logcat"
+version = "0.1.0"
+edition = "2021"
+description = "Log capture tool using ar_dbg_client and rslog"
+
+[lints]
+workspace = true
+
+[dependencies]
+# 本地依赖
+ar_dbg_client = { path = "../ar_dbg_client" }
+rslog = { path = "../rslog" }
+
+# 异步运行时
+tokio = { version = "1", features = ["full", "process"] }
+
+# SSH 远程连接
+russh = "0.50"
+
+# 命令行
+clap = { version = "4", features = ["derive"] }
+
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 错误处理
+thiserror = "1.0"
+anyhow = "1.0"
+
+# 序列化
+serde = { version = "1.0", features = ["derive"] }
+
+# Ctrl+C 处理
+ctrlc = { version = "3.4", features = ["termination"] }
+
+[[bin]]
+name = "logcat"
+path = "src/main.rs"

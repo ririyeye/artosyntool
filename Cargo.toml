@@ -3,7 +3,11 @@ resolver = "2"
 members = [
     "ar_dbg_client",
     "rslog",
+    "logcat",
 ]
+
+[workspace.lints.rust]
+# 可以在这里添加工作区级别的 lint 配置
 
 # 共享的工作空间依赖（可选）
 [workspace.dependencies]

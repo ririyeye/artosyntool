@@ -10,6 +10,7 @@
       "page": 0,
       "offset": 0,
       "width": 4,
+      "irq_mask": "0xFFFF",
       "name": "status_reg",
       "description": "状态寄存器",
       "unit": ""
@@ -18,22 +19,25 @@
       "page": 0,
       "offset": 4,
       "width": 4,
+      "irq_mask": "0x0006",
       "name": "ctrl_reg",
-      "description": "控制寄存器",
+      "description": "控制寄存器 (TX_BR_END | CSMA_START_ENC 触发)",
       "unit": ""
     },
     {
       "page": 0,
       "offset": 8,
       "width": 4,
+      "irq_mask": "0x0001",
       "name": "counter",
-      "description": "计数器",
+      "description": "计数器 (RX_BR_END 触发)",
       "unit": "次"
     },
     {
       "page": 1,
       "offset": 0,
       "width": 4,
+      "irq_mask": "0xFFFF",
       "name": "data_reg",
       "description": "数据寄存器",
       "unit": ""

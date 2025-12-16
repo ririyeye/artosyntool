@@ -239,6 +239,8 @@ pub struct RegTraceItem {
     pub offset: u8,
     /// 读取宽度: 1/2/4 字节
     pub width: u8,
+    /// 中断触发掩码 (见 IrqType)
+    pub irq_mask: u16,
 }
 
 impl RegTraceItem {
@@ -247,12 +249,62 @@ impl RegTraceItem {
             page,
             offset,
             width,
+            irq_mask: 0xFFFF, // 默认所有中断
         }
     }
 
-    /// 编码为字节 (4字节)
-    pub fn encode(&self) -> [u8; 4] {
-        [self.page, self.offset, self.width, 0]
+    /// 创建带中断掩码的配置项
+    pub fn with_irq_mask(page: u8, offset: u8, width: u8, irq_mask: u16) -> Self {
+        Self {
+            page,
+            offset,
+            width,
+            irq_mask,
+        }
+    }
+
+    /// 编码为字节 (5字节: page, offset, width, irq_mask_lo, irq_mask_hi)
+    pub fn encode(&self) -> [u8; 5] {
+        let irq_bytes = self.irq_mask.to_le_bytes();
+        [
+            self.page,
+            self.offset,
+            self.width,
+            irq_bytes[0],
+            irq_bytes[1],
+        ]
+    }
+}
+
+/// 中断类型掩码常量
+pub mod irq_type {
+    pub const RX_BR_END: u16 = 0x0001;
+    pub const TX_BR_END: u16 = 0x0002;
+    pub const CSMA_START_ENC: u16 = 0x0004;
+    pub const FSM_STATE_CHG: u16 = 0x0008;
+    pub const FSM_TRX: u16 = 0x0010;
+    pub const SLOT_SOP: u16 = 0x0020;
+    pub const TX_PRE_ENC: u16 = 0x0040;
+    pub const RX_RDOUT: u16 = 0x0080;
+    pub const FCH_DEC: u16 = 0x0100;
+    pub const FREQ_SWEEP: u16 = 0x0200;
+    pub const ALL: u16 = 0xFFFF;
+
+    /// 将中断类型值转换为名称
+    pub fn irq_name(irq_type: u16) -> &'static str {
+        match irq_type {
+            0x0001 => "RX_BR_END",
+            0x0002 => "TX_BR_END",
+            0x0004 => "CSMA_START_ENC",
+            0x0008 => "FSM_STATE_CHG",
+            0x0010 => "FSM_TRX",
+            0x0020 => "SLOT_SOP",
+            0x0040 => "TX_PRE_ENC",
+            0x0080 => "RX_RDOUT",
+            0x0100 => "FCH_DEC",
+            0x0200 => "FREQ_SWEEP",
+            _ => "UNKNOWN",
+        }
     }
 }
 
@@ -283,18 +335,18 @@ impl Default for ConfigRequest {
 impl ConfigRequest {
     /// 编码为消息 payload
     pub fn encode(&self) -> Vec<u8> {
-        let mut payload = Vec::with_capacity(4 + MAX_ITEMS * 4);
+        let mut payload = Vec::with_capacity(4 + MAX_ITEMS * 5);
 
         payload.push(self.items.len() as u8);
         payload.push(self.sample_div);
         payload.extend_from_slice(&self.buffer_depth.to_le_bytes());
 
-        // 填充到16项
+        // 填充到16项 (每项5字节)
         for i in 0..MAX_ITEMS {
             if i < self.items.len() {
                 payload.extend_from_slice(&self.items[i].encode());
             } else {
-                payload.extend_from_slice(&[0u8; 4]);
+                payload.extend_from_slice(&[0u8; 5]);
             }
         }
 
@@ -423,6 +475,8 @@ impl FetchRequest {
 pub struct TraceRecord {
     pub timestamp_us: u32,
     pub seq_id: u32,
+    /// 触发该记录的中断类型
+    pub irq_type: u32,
     pub values: Vec<u32>,
 }
 
@@ -431,9 +485,10 @@ impl std::fmt::Display for TraceRecord {
         let values_str: Vec<String> = self.values.iter().map(|v| format!("0x{:08X}", v)).collect();
         write!(
             f,
-            "[{:5}] ts={:10}us: {}",
+            "[{:5}] ts={:10}us irq={}: {}",
             self.seq_id,
             self.timestamp_us,
+            irq_type::irq_name(self.irq_type as u16),
             values_str.join(", ")
         )
     }
@@ -461,7 +516,8 @@ impl FetchResponse {
         let remaining_count = u16::from_le_bytes([data[3], data[4]]);
 
         let mut records = Vec::new();
-        let record_size = 8 + 4 * item_count as usize;
+        // 每条记录: ts(4) + seq_id(4) + irq_type(4) + values(item_count * 4)
+        let record_size = 12 + 4 * item_count as usize;
         let mut offset = 5;
 
         for _ in 0..record_count {
@@ -481,10 +537,16 @@ impl FetchResponse {
                 data[offset + 6],
                 data[offset + 7],
             ]);
+            let irq_type = u32::from_le_bytes([
+                data[offset + 8],
+                data[offset + 9],
+                data[offset + 10],
+                data[offset + 11],
+            ]);
 
             let mut values = Vec::new();
             for i in 0..item_count as usize {
-                let v_offset = offset + 8 + i * 4;
+                let v_offset = offset + 12 + i * 4;
                 if v_offset + 4 <= data.len() {
                     values.push(u32::from_le_bytes([
                         data[v_offset],
@@ -498,6 +560,7 @@ impl FetchResponse {
             records.push(TraceRecord {
                 timestamp_us,
                 seq_id,
+                irq_type,
                 values,
             });
             offset += record_size;
@@ -632,8 +695,8 @@ mod tests {
         let config = ConfigRequest::default();
         let payload = config.encode();
 
-        // item_count(1) + sample_div(1) + buffer_depth(2) + items(16*4)
-        assert_eq!(payload.len(), 4 + MAX_ITEMS * 4);
+        // item_count(1) + sample_div(1) + buffer_depth(2) + items(16*5)
+        assert_eq!(payload.len(), 4 + MAX_ITEMS * 5);
         assert_eq!(payload[0], 4); // 4 items by default
         assert_eq!(payload[1], 1); // sample_div = 1
     }

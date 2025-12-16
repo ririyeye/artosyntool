@@ -1,6 +1,6 @@
 //! 远程模式: 通过 SSH 远程执行 ar_logcat，同时采集寄存器跟踪数据
 
-use crate::reg_meta::{RegTraceConfig, RegTraceDescriptor};
+use crate::reg_meta::{RegTraceConfig, RegTraceDescriptor, CHUNK_MAGIC_CONFIG, CHUNK_MAGIC_DATA};
 use anyhow::{anyhow, Result};
 use ar_dbg_client::{ClientConfig, RegTraceClient, TraceRecord};
 use rslog::StreamWriter;
@@ -58,14 +58,60 @@ impl client::Handler for SshHandler {
     }
 }
 
-/// 将单条寄存器记录打包: 8字节时间戳(ms) + 4字节seq_id + N*4字节values
+/// 将单条寄存器记录打包: 8字节时间戳(ms) + 4字节seq_id + 4字节irq_type + N*4字节values
 fn record_to_bytes(ts: u64, record: &TraceRecord) -> Vec<u8> {
-    let mut data = Vec::with_capacity(8 + 4 + record.values.len() * 4);
+    let mut data = Vec::with_capacity(8 + 4 + 4 + record.values.len() * 4);
     data.extend_from_slice(&ts.to_le_bytes());
     data.extend_from_slice(&record.seq_id.to_le_bytes());
+    data.extend_from_slice(&record.irq_type.to_le_bytes());
     for v in &record.values {
         data.extend_from_slice(&v.to_le_bytes());
     }
+    data
+}
+
+/// 打包配置描述块 (Chunk0)
+/// 格式: [MAGIC:4B][item_count:1B][sample_div:1B][reserved:2B][items:N*8B]
+/// 每个 item: [page:1B][offset:1B][width:1B][reserved:1B][irq_mask:2B][reserved:2B]
+fn pack_config_chunk(config: &RegTraceConfig) -> Vec<u8> {
+    let item_count = config.items.len() as u8;
+    // 4(magic) + 1(count) + 1(div) + 2(reserved) + N*8(items)
+    let mut data = Vec::with_capacity(8 + config.items.len() * 8);
+
+    // Magic
+    data.extend_from_slice(&CHUNK_MAGIC_CONFIG);
+    // item_count
+    data.push(item_count);
+    // sample_div
+    data.push(config.sample_div);
+    // reserved
+    data.extend_from_slice(&[0u8; 2]);
+
+    // Items
+    for item in &config.items {
+        data.push(item.page);
+        data.push(item.offset);
+        data.push(item.width);
+        data.push(0); // reserved
+        data.extend_from_slice(&item.irq_mask.to_le_bytes());
+        data.extend_from_slice(&[0u8; 2]); // reserved
+    }
+
+    data
+}
+
+/// 打包数据块 (ChunkN)
+/// 格式: [MAGIC:4B][record_count:2B][records:...]
+fn pack_data_chunk(records_data: &[u8], record_count: u16) -> Vec<u8> {
+    let mut data = Vec::with_capacity(6 + records_data.len());
+
+    // Magic
+    data.extend_from_slice(&CHUNK_MAGIC_DATA);
+    // record_count
+    data.extend_from_slice(&record_count.to_le_bytes());
+    // records
+    data.extend_from_slice(records_data);
+
     data
 }
 
@@ -285,17 +331,25 @@ async fn run_reg_stream(
     }
     info!("reg: Trace started");
 
-    // 首次写入 descriptor
+    // 首次写入配置描述块 (Chunk0)
     if !*descriptor_written {
+        // 写入二进制配置块
+        let config_chunk = pack_config_chunk(config);
+        let ts = current_timestamp();
+        {
+            let mut w = writer.lock().await;
+            w.write_binary_ch(REG_CHANNEL, ts, &config_chunk)?;
+        }
+
+        // 同时写入 JSON descriptor (便于人工查看)
         let descriptor = RegTraceDescriptor::from_config(config);
         let json = serde_json::to_string(&descriptor)?;
-        let ts = current_timestamp();
         {
             let mut w = writer.lock().await;
             w.write_text_ch(REG_CHANNEL, ts, &json)?;
         }
         *descriptor_written = true;
-        info!("reg: Descriptor written");
+        info!("reg: Config chunk (Chunk0) and descriptor written");
     }
 
     // 批量缓冲区
@@ -309,10 +363,11 @@ async fn run_reg_stream(
         // 检查停止信号
         if !running.load(Ordering::SeqCst) {
             info!("reg: Stopping stream due to signal");
-            // 写入剩余批量数据
+            // 写入剩余批量数据 (打包为 ChunkN)
             if !batch.is_empty() {
+                let data_chunk = pack_data_chunk(&batch, batch_count as u16);
                 let mut w = writer.lock().await;
-                if let Err(e) = w.write_binary_ch(REG_CHANNEL, current_timestamp(), &batch) {
+                if let Err(e) = w.write_binary_ch(REG_CHANNEL, current_timestamp(), &data_chunk) {
                     error!("reg: Final batch write error: {}", e);
                 }
             }
@@ -321,12 +376,13 @@ async fn run_reg_stream(
             return Ok(());
         }
 
-        // 检查是否需要定时刷新批量数据
+        // 检查是否需要定时刷新批量数据 (打包为 ChunkN)
         if !batch.is_empty() && last_flush.elapsed() >= flush_interval {
             let ts = current_timestamp();
+            let data_chunk = pack_data_chunk(&batch, batch_count as u16);
             {
                 let mut w = writer.lock().await;
-                if let Err(e) = w.write_binary_ch(REG_CHANNEL, ts, &batch) {
+                if let Err(e) = w.write_binary_ch(REG_CHANNEL, ts, &data_chunk) {
                     error!("reg: Batch write error: {}", e);
                 }
             }

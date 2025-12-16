@@ -7,6 +7,16 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
+// ============================================================================
+// Chunk 魔数定义 (用于区分不同类型的二进制块)
+// ============================================================================
+
+/// Chunk0 配置描述块魔数: 0x52 0x54 0x43 0x30 ("RTC0")
+pub const CHUNK_MAGIC_CONFIG: [u8; 4] = [0x52, 0x54, 0x43, 0x30];
+
+/// ChunkN 数据块魔数: 0x52 0x54 0x44 0x4E ("RTDN")
+pub const CHUNK_MAGIC_DATA: [u8; 4] = [0x52, 0x54, 0x44, 0x4E];
+
 /// 单个寄存器配置项（JSON 格式）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegItemConfig {
@@ -18,6 +28,12 @@ pub struct RegItemConfig {
     /// 读取宽度: 1/2/4 字节
     #[serde(default = "default_width")]
     pub width: u8,
+    /// 中断触发掩码 (0xFFFF 表示所有中断)
+    #[serde(
+        default = "default_irq_mask",
+        deserialize_with = "deserialize_hex_or_int_u16"
+    )]
+    pub irq_mask: u16,
     /// 字段名称（用于 CSV 表头和描述）
     #[serde(default)]
     pub name: String,
@@ -31,6 +47,10 @@ pub struct RegItemConfig {
 
 fn default_width() -> u8 {
     4
+}
+
+fn default_irq_mask() -> u16 {
+    0xFFFF
 }
 
 /// 自定义反序列化：支持整数或十六进制字符串
@@ -55,6 +75,33 @@ where
                 u8::from_str_radix(&s[2..], 16).map_err(D::Error::custom)
             } else {
                 s.parse::<u8>().map_err(D::Error::custom)
+            }
+        }
+    }
+}
+
+/// 自定义反序列化 u16：支持整数或十六进制字符串
+fn deserialize_hex_or_int_u16<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum HexOrInt {
+        Int(u16),
+        Str(String),
+    }
+
+    match HexOrInt::deserialize(deserializer)? {
+        HexOrInt::Int(v) => Ok(v),
+        HexOrInt::Str(s) => {
+            let s = s.trim();
+            if s.starts_with("0x") || s.starts_with("0X") {
+                u16::from_str_radix(&s[2..], 16).map_err(D::Error::custom)
+            } else {
+                s.parse::<u16>().map_err(D::Error::custom)
             }
         }
     }
@@ -121,6 +168,7 @@ impl Default for RegTraceConfig {
                     page: 0,
                     offset: 0x00,
                     width: 4,
+                    irq_mask: 0xFFFF,
                     name: "reg_0x00".to_string(),
                     description: "页0偏移0x00".to_string(),
                     unit: "".to_string(),
@@ -129,6 +177,7 @@ impl Default for RegTraceConfig {
                     page: 0,
                     offset: 0x04,
                     width: 4,
+                    irq_mask: 0xFFFF,
                     name: "reg_0x04".to_string(),
                     description: "页0偏移0x04".to_string(),
                     unit: "".to_string(),
@@ -137,6 +186,7 @@ impl Default for RegTraceConfig {
                     page: 0,
                     offset: 0x08,
                     width: 4,
+                    irq_mask: 0xFFFF,
                     name: "reg_0x08".to_string(),
                     description: "页0偏移0x08".to_string(),
                     unit: "".to_string(),
@@ -145,6 +195,7 @@ impl Default for RegTraceConfig {
                     page: 0,
                     offset: 0x0C,
                     width: 4,
+                    irq_mask: 0xFFFF,
                     name: "reg_0x0C".to_string(),
                     description: "页0偏移0x0C".to_string(),
                     unit: "".to_string(),
@@ -185,7 +236,9 @@ impl RegTraceConfig {
             items: self
                 .items
                 .iter()
-                .map(|item| RegTraceItem::new(item.page, item.offset, item.width))
+                .map(|item| {
+                    RegTraceItem::with_irq_mask(item.page, item.offset, item.width, item.irq_mask)
+                })
                 .collect(),
             sample_div: self.sample_div,
             buffer_depth: self.buffer_depth,
@@ -216,6 +269,8 @@ pub struct FieldInfo {
     pub page: u8,
     pub offset: u8,
     pub width: u8,
+    /// 中断触发掩码
+    pub irq_mask: u16,
     pub description: String,
     pub unit: String,
 }
@@ -227,6 +282,10 @@ pub struct RegTraceDescriptor {
     pub name: String,
     /// 配置描述
     pub description: String,
+    /// 采样分频
+    pub sample_div: u8,
+    /// 缓冲区深度
+    pub buffer_depth: u16,
     /// 字段列表
     pub fields: Vec<FieldInfo>,
     /// 时间戳单位
@@ -253,6 +312,7 @@ impl RegTraceDescriptor {
                     page: item.page,
                     offset: item.offset,
                     width: item.width,
+                    irq_mask: item.irq_mask,
                     description: item.description.clone(),
                     unit: item.unit.clone(),
                 }
@@ -262,6 +322,8 @@ impl RegTraceDescriptor {
         Self {
             name: config.name.clone(),
             description: config.description.clone(),
+            sample_div: config.sample_div,
+            buffer_depth: config.buffer_depth,
             fields,
             timestamp_unit: "seconds (Unix epoch)".to_string(),
             plotjuggler_notes: "CSV第一列timestamp为时间轴(秒)，可直接在PlotJuggler中选择作为X轴"
@@ -290,6 +352,7 @@ pub fn generate_example_config() -> String {
                 page: 0,
                 offset: 0x00,
                 width: 4,
+                irq_mask: 0xFFFF,
                 name: "status_reg".to_string(),
                 description: "状态寄存器".to_string(),
                 unit: "".to_string(),
@@ -298,6 +361,7 @@ pub fn generate_example_config() -> String {
                 page: 0,
                 offset: 0x04,
                 width: 4,
+                irq_mask: 0x0006, // TX_BR_END | CSMA_START_ENC
                 name: "ctrl_reg".to_string(),
                 description: "控制寄存器".to_string(),
                 unit: "".to_string(),
@@ -306,6 +370,7 @@ pub fn generate_example_config() -> String {
                 page: 1,
                 offset: 0x10,
                 width: 4,
+                irq_mask: 0x0001, // RX_BR_END
                 name: "snr_raw".to_string(),
                 description: "SNR原始值 (dB = 10*log10(value/64))".to_string(),
                 unit: "raw".to_string(),
@@ -314,6 +379,7 @@ pub fn generate_example_config() -> String {
                 page: 4,
                 offset: 0xDC,
                 width: 4,
+                irq_mask: 0xFFFF,
                 name: "agc_value".to_string(),
                 description: "AGC增益值".to_string(),
                 unit: "dB".to_string(),
@@ -348,11 +414,12 @@ mod tests {
         let json = r#"{
             "name": "test",
             "items": [
-                {"page": 0, "offset": "0x10", "width": 4, "name": "test_reg"}
+                {"page": 0, "offset": "0x10", "width": 4, "irq_mask": "0x0006", "name": "test_reg"}
             ]
         }"#;
         let config: RegTraceConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.items[0].offset, 0x10);
+        assert_eq!(config.items[0].irq_mask, 0x0006);
     }
 
     #[test]

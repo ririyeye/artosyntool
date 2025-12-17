@@ -16,7 +16,7 @@ rslog = { path = "../rslog" }
 tokio = { version = "1", features = ["full", "process"] }
 
 # SSH 远程连接
-russh = "0.50"
+russh = "0.55"
 
 # 命令行
 clap = { version = "4", features = ["derive"] }
@@ -26,18 +26,18 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # 错误处理
-thiserror = "1.0"
+thiserror = "2.0"
 anyhow = "1.0"
 
 # 字节处理
-bytes = "1.5"
+bytes = "1.11"
 
 # 序列化
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Ctrl+C 处理
-ctrlc = { version = "3.4", features = ["termination"] }
+ctrlc = { version = "3.5", features = ["termination"] }
 
 [[bin]]
 name = "logcat"

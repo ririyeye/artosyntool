@@ -38,7 +38,8 @@ pub mod protocol;
 
 pub use client::{ClientConfig, ClientError, RegTraceClient};
 pub use protocol::{
-    irq_type, CmdId, ConfigRequest, ConfigResponse, ErrorCode, FetchRequest, FetchResponse,
-    GenericResponse, Message, PingResponse, RegTraceItem, StatusResponse, TraceRecord,
-    VersionResponse, DEFAULT_PORT, MAX_ITEMS, PROTOCOL_VERSION,
+    irq_type, CmdId, ConfigRequest, ConfigResponse, DataPushResponse, ErrorCode, FetchRequest,
+    FetchResponse, GenericResponse, Message, PingResponse, RegTraceItem, ShmInfoResponse,
+    StatusResponse, TraceRecord, VersionResponse, DEFAULT_PORT, MAX_BATCH_RECORDS, MAX_ITEMS,
+    MAX_ITEM_WIDTH, MAX_RECORD_DATA, PROTOCOL_VERSION, RECORD_HEADER_SIZE,
 };

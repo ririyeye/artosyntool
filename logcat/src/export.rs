@@ -269,6 +269,7 @@ fn parse_config_chunk(data: &[u8]) -> Option<ChunkConfig> {
 
 /// 解析 ChunkN 数据块
 /// 格式: [MAGIC:4B][record_count:2B][records:...]
+/// 每条记录: ts_us(8) + seq_id(4) + irq_type(2) + valid_mask(2) + raw_data[...]
 fn parse_data_chunk(data: &[u8], item_count: usize) -> Vec<(u64, u32, u32, Vec<u32>)> {
     // 最小长度: 4(magic) + 2(count) = 6
     if data.len() < 6 {
@@ -283,19 +284,19 @@ fn parse_data_chunk(data: &[u8], item_count: usize) -> Vec<(u64, u32, u32, Vec<u
     let record_count = u16::from_le_bytes([data[4], data[5]]) as usize;
     let records_data = &data[6..];
 
-    // 每条记录大小: ts(8) + seq_id(4) + irq_type(4) + values(item_count * 4)
-    let record_size = 8 + 4 + 4 + item_count * 4;
+    // 记录头: ts_us(8) + seq_id(4) + irq_type(2) + valid_mask(2) = 16字节
+    const HEADER_SIZE: usize = 16;
 
     let mut results = Vec::with_capacity(record_count);
     let mut offset = 0;
 
     for _ in 0..record_count {
-        if offset + record_size > records_data.len() {
+        if offset + HEADER_SIZE > records_data.len() {
             break;
         }
 
-        // 读取时间戳
-        let ts = u64::from_le_bytes([
+        // 读取时间戳 (us)
+        let ts_us = u64::from_le_bytes([
             records_data[offset],
             records_data[offset + 1],
             records_data[offset + 2],
@@ -314,42 +315,48 @@ fn parse_data_chunk(data: &[u8], item_count: usize) -> Vec<(u64, u32, u32, Vec<u
             records_data[offset + 11],
         ]);
 
-        // 读取 irq_type
-        let irq_type = u32::from_le_bytes([
-            records_data[offset + 12],
-            records_data[offset + 13],
-            records_data[offset + 14],
-            records_data[offset + 15],
-        ]);
+        // 读取 irq_type (u16)
+        let irq_type =
+            u16::from_le_bytes([records_data[offset + 12], records_data[offset + 13]]) as u32;
 
-        // 读取 values
+        // 读取 valid_mask (u16)
+        let valid_mask = u16::from_le_bytes([records_data[offset + 14], records_data[offset + 15]]);
+
+        offset += HEADER_SIZE;
+
+        // 按 valid_mask 读取数据，每个有效项占 4 字节
         let mut values = Vec::with_capacity(item_count);
         for i in 0..item_count {
-            let v_offset = offset + 16 + i * 4;
-            if v_offset + 4 <= records_data.len() {
-                values.push(u32::from_le_bytes([
-                    records_data[v_offset],
-                    records_data[v_offset + 1],
-                    records_data[v_offset + 2],
-                    records_data[v_offset + 3],
-                ]));
+            if valid_mask & (1 << i) != 0 {
+                if offset + 4 <= records_data.len() {
+                    values.push(u32::from_le_bytes([
+                        records_data[offset],
+                        records_data[offset + 1],
+                        records_data[offset + 2],
+                        records_data[offset + 3],
+                    ]));
+                    offset += 4;
+                } else {
+                    values.push(0); // 数据不足，填充0
+                }
+            } else {
+                values.push(0); // 该项无效，填充0
             }
         }
 
-        results.push((ts, seq_id, irq_type, values));
-        offset += record_size;
+        results.push((ts_us, seq_id, irq_type, values));
     }
 
     results
 }
 
 /// 格式化 CSV 行
-fn format_reg_row(ts: u64, seq_id: u32, irq_type: u32, values: &[u32]) -> String {
+fn format_reg_row(ts_us: u64, seq_id: u32, irq_type: u32, values: &[u32]) -> String {
     let mut fields = Vec::with_capacity(3 + values.len());
 
-    // 将毫秒时间戳转换为秒（浮点数），PlotJuggler 更好识别
-    let ts_sec = ts as f64 / 1000.0;
-    fields.push(format!("{:.3}", ts_sec));
+    // 将微秒时间戳转换为秒（浮点数），PlotJuggler 更好识别
+    let ts_sec = ts_us as f64 / 1_000_000.0;
+    fields.push(format!("{:.6}", ts_sec));
     fields.push(seq_id.to_string());
     fields.push(format!("0x{:04X}", irq_type));
 

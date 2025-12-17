@@ -32,24 +32,36 @@ pub const DEFAULT_PORT: u16 = 12345;
 /// 最大配置项数量
 pub const MAX_ITEMS: usize = 16;
 
-/// 最大批量记录数
-pub const MAX_BATCH_RECORDS: usize = 50;
+/// 单个配置项最大宽度 (共享内存端限制)
+pub const MAX_ITEM_WIDTH: usize = 32;
+
+/// 单条记录最大数据长度
+pub const MAX_RECORD_DATA: usize = MAX_ITEMS * MAX_ITEM_WIDTH;
+
+/// 最大批量记录数 - 需要能一次发完整个buffer
+pub const MAX_BATCH_RECORDS: usize = 500;
 
 /// 默认缓冲深度
 pub const DEFAULT_BUFFER_DEPTH: u16 = 100;
+
+/// 记录头大小 (不含data): timestamp_us(8) + seq_id(4) + irq_type(2) + valid_mask(2) + data_len(2)
+pub const RECORD_HEADER_SIZE: usize = 18;
 
 /// TCP 命令 ID
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum CmdId {
-    Config = 0xB0,      // 配置抓取项
-    Start = 0xB1,       // 启动抓取
-    Stop = 0xB2,        // 停止抓取
-    QueryStatus = 0xB3, // 查询缓冲区状态
-    FetchData = 0xB4,   // 拉取数据
-    ClearBuffer = 0xB5, // 清空缓冲区
-    GetVersion = 0xB8,  // 获取版本信息
-    Ping = 0xB9,        // 心跳检测
+    Config = 0xB0,       // 配置抓取项
+    Start = 0xB1,        // 启动抓取
+    Stop = 0xB2,         // 停止抓取
+    QueryStatus = 0xB3,  // 查询缓冲区状态
+    FetchData = 0xB4,    // 拉取数据 (统一使用共享内存)
+    ClearBuffer = 0xB5,  // 清空缓冲区
+    GetShmInfo = 0xB6,   // 获取共享内存信息
+    FetchDataShm = 0xB7, // [别名] 与 FetchData 相同
+    GetVersion = 0xB8,   // 获取版本信息
+    Ping = 0xB9,         // 心跳检测
+    DataPush = 0xBA,     // 服务端主动推送数据
 }
 
 impl From<u8> for CmdId {
@@ -61,8 +73,11 @@ impl From<u8> for CmdId {
             0xB3 => CmdId::QueryStatus,
             0xB4 => CmdId::FetchData,
             0xB5 => CmdId::ClearBuffer,
+            0xB6 => CmdId::GetShmInfo,
+            0xB7 => CmdId::FetchDataShm,
             0xB8 => CmdId::GetVersion,
             0xB9 => CmdId::Ping,
+            0xBA => CmdId::DataPush,
             _ => CmdId::Ping, // 默认
         }
     }
@@ -263,15 +278,18 @@ impl RegTraceItem {
         }
     }
 
-    /// 编码为字节 (5字节: page, offset, width, irq_mask_lo, irq_mask_hi)
-    pub fn encode(&self) -> [u8; 5] {
+    /// 编码为字节 (8字节: page, offset, width, reserved, irq_mask[2], reserved2[2])
+    pub fn encode(&self) -> [u8; 8] {
         let irq_bytes = self.irq_mask.to_le_bytes();
         [
             self.page,
             self.offset,
             self.width,
+            0, // reserved
             irq_bytes[0],
             irq_bytes[1],
+            0, // reserved2[0]
+            0, // reserved2[1]
         ]
     }
 }
@@ -334,19 +352,21 @@ impl Default for ConfigRequest {
 
 impl ConfigRequest {
     /// 编码为消息 payload
+    /// 格式: item_count(1) + sample_div(1) + buffer_depth(2) + reserved(4) + items(16*8)
     pub fn encode(&self) -> Vec<u8> {
-        let mut payload = Vec::with_capacity(4 + MAX_ITEMS * 5);
+        let mut payload = Vec::with_capacity(8 + MAX_ITEMS * 8);
 
         payload.push(self.items.len() as u8);
         payload.push(self.sample_div);
         payload.extend_from_slice(&self.buffer_depth.to_le_bytes());
+        payload.extend_from_slice(&[0u8; 4]); // reserved
 
-        // 填充到16项 (每项5字节)
+        // 填充到16项 (每项8字节)
         for i in 0..MAX_ITEMS {
             if i < self.items.len() {
                 payload.extend_from_slice(&self.items[i].encode());
             } else {
-                payload.extend_from_slice(&[0u8; 5]);
+                payload.extend_from_slice(&[0u8; 8]);
             }
         }
 
@@ -420,6 +440,8 @@ pub struct StatusResponse {
     pub is_running: bool,
     pub item_count: u8,
     pub buffer_depth: u16,
+    /// 中断触发掩码 (新增)
+    pub irq_trigger_mask: u16,
     pub record_count: u16,
     pub overflow_count: u16,
     pub total_samples: u32,
@@ -427,17 +449,20 @@ pub struct StatusResponse {
 
 impl StatusResponse {
     pub fn from_payload(data: &[u8]) -> Option<Self> {
-        if data.len() < 16 {
+        if data.len() < 20 {
             return None;
         }
         Some(Self {
             result: ErrorCode::from(data[0] as i8),
+            // data[1..4] reserved
             is_running: data[4] != 0,
             item_count: data[5],
             buffer_depth: u16::from_le_bytes([data[6], data[7]]),
-            record_count: u16::from_le_bytes([data[8], data[9]]),
-            overflow_count: u16::from_le_bytes([data[10], data[11]]),
-            total_samples: u32::from_le_bytes([data[12], data[13], data[14], data[15]]),
+            irq_trigger_mask: u16::from_le_bytes([data[8], data[9]]),
+            record_count: u16::from_le_bytes([data[10], data[11]]),
+            overflow_count: u16::from_le_bytes([data[12], data[13]]),
+            // data[14..16] reserved
+            total_samples: u32::from_le_bytes([data[16], data[17], data[18], data[19]]),
         })
     }
 }
@@ -470,13 +495,20 @@ impl FetchRequest {
     }
 }
 
-/// 单条采集记录
+/// 单条采集记录 (新格式：变长、稀疏)
 #[derive(Debug, Clone)]
 pub struct TraceRecord {
-    pub timestamp_us: u32,
+    /// 时间戳(微秒) - 64位不回绕
+    pub timestamp_us: u64,
+    /// 记录序列号
     pub seq_id: u32,
-    /// 触发该记录的中断类型
-    pub irq_type: u32,
+    /// 触发该记录的中断类型 (irq_type_e)
+    pub irq_type: u16,
+    /// 有效配置项位图: bit[i]=1 表示 item[i] 数据有效
+    pub valid_mask: u16,
+    /// 原始数据 (紧凑排列，按 valid_mask 中置位的配置项顺序)
+    pub raw_data: Vec<u8>,
+    /// 解析后的值 (兼容旧接口，按 u32 解析)
     pub values: Vec<u32>,
 }
 
@@ -485,16 +517,17 @@ impl std::fmt::Display for TraceRecord {
         let values_str: Vec<String> = self.values.iter().map(|v| format!("0x{:08X}", v)).collect();
         write!(
             f,
-            "[{:5}] ts={:10}us irq={}: {}",
+            "[{:5}] ts={:12}us irq={:<14} mask=0x{:04X}: {}",
             self.seq_id,
             self.timestamp_us,
-            irq_type::irq_name(self.irq_type as u16),
+            irq_type::irq_name(self.irq_type),
+            self.valid_mask,
             values_str.join(", ")
         )
     }
 }
 
-/// 拉取数据响应
+/// 拉取数据响应 (新格式：变长记录)
 #[derive(Debug, Clone)]
 pub struct FetchResponse {
     pub result: ErrorCode,
@@ -505,65 +538,86 @@ pub struct FetchResponse {
 }
 
 impl FetchResponse {
+    /// 从 payload 解析响应 (新变长格式)
+    ///
+    /// 响应头格式 (8字节):
+    ///   result(1) + reserved(3) + record_count(1) + item_count(1) + remaining_count(2)
+    ///
+    /// 每条记录格式 (变长):
+    ///   timestamp_us(8) + seq_id(4) + irq_type(2) + valid_mask(2) + data_len(2) + data[data_len]
     pub fn from_payload(data: &[u8]) -> Option<Self> {
-        if data.len() < 5 {
+        if data.len() < 8 {
             return None;
         }
 
         let result = ErrorCode::from(data[0] as i8);
-        let record_count = data[1];
-        let item_count = data[2];
-        let remaining_count = u16::from_le_bytes([data[3], data[4]]);
+        // data[1..4] reserved
+        let record_count = data[4];
+        let item_count = data[5];
+        let remaining_count = u16::from_le_bytes([data[6], data[7]]);
 
         let mut records = Vec::new();
-        // 每条记录: ts(4) + seq_id(4) + irq_type(4) + values(item_count * 4)
-        let record_size = 12 + 4 * item_count as usize;
-        let mut offset = 5;
+        let mut offset = 8; // 响应头大小
 
         for _ in 0..record_count {
-            if offset + record_size > data.len() {
+            // 检查记录头是否完整 (18字节)
+            if offset + RECORD_HEADER_SIZE > data.len() {
                 break;
             }
 
-            let timestamp_us = u32::from_le_bytes([
+            // 解析记录头
+            let timestamp_us = u64::from_le_bytes([
                 data[offset],
                 data[offset + 1],
                 data[offset + 2],
                 data[offset + 3],
-            ]);
-            let seq_id = u32::from_le_bytes([
                 data[offset + 4],
                 data[offset + 5],
                 data[offset + 6],
                 data[offset + 7],
             ]);
-            let irq_type = u32::from_le_bytes([
+            let seq_id = u32::from_le_bytes([
                 data[offset + 8],
                 data[offset + 9],
                 data[offset + 10],
                 data[offset + 11],
             ]);
+            let irq_type = u16::from_le_bytes([data[offset + 12], data[offset + 13]]);
+            let valid_mask = u16::from_le_bytes([data[offset + 14], data[offset + 15]]);
+            let data_len = u16::from_le_bytes([data[offset + 16], data[offset + 17]]) as usize;
 
+            offset += RECORD_HEADER_SIZE;
+
+            // 检查数据区是否完整
+            if offset + data_len > data.len() {
+                break;
+            }
+
+            // 提取原始数据
+            let raw_data = data[offset..offset + data_len].to_vec();
+            offset += data_len;
+
+            // 按 u32 解析值 (兼容旧接口，每4字节一个值)
             let mut values = Vec::new();
-            for i in 0..item_count as usize {
-                let v_offset = offset + 12 + i * 4;
-                if v_offset + 4 <= data.len() {
-                    values.push(u32::from_le_bytes([
-                        data[v_offset],
-                        data[v_offset + 1],
-                        data[v_offset + 2],
-                        data[v_offset + 3],
-                    ]));
-                }
+            let mut v_offset = 0;
+            while v_offset + 4 <= raw_data.len() {
+                values.push(u32::from_le_bytes([
+                    raw_data[v_offset],
+                    raw_data[v_offset + 1],
+                    raw_data[v_offset + 2],
+                    raw_data[v_offset + 3],
+                ]));
+                v_offset += 4;
             }
 
             records.push(TraceRecord {
                 timestamp_us,
                 seq_id,
                 irq_type,
+                valid_mask,
+                raw_data,
                 values,
             });
-            offset += record_size;
         }
 
         Some(Self {
@@ -624,6 +678,40 @@ impl PingResponse {
     }
 }
 
+/// 共享内存信息响应
+#[derive(Debug, Clone)]
+pub struct ShmInfoResponse {
+    pub result: ErrorCode,
+    /// 共享内存物理地址
+    pub shm_pa: u32,
+    /// 共享内存总大小
+    pub shm_size: u32,
+    /// 控制块偏移
+    pub ctrl_offset: u32,
+    /// 数据区偏移
+    pub data_offset: u32,
+}
+
+impl ShmInfoResponse {
+    pub fn from_payload(data: &[u8]) -> Option<Self> {
+        if data.len() < 20 {
+            return None;
+        }
+        Some(Self {
+            result: ErrorCode::from(data[0] as i8),
+            // data[1..4] reserved
+            shm_pa: u32::from_le_bytes([data[4], data[5], data[6], data[7]]),
+            shm_size: u32::from_le_bytes([data[8], data[9], data[10], data[11]]),
+            ctrl_offset: u32::from_le_bytes([data[12], data[13], data[14], data[15]]),
+            data_offset: u32::from_le_bytes([data[16], data[17], data[18], data[19]]),
+        })
+    }
+}
+
+/// 数据推送响应 (服务端主动推送，格式与 FetchResponse 相同)
+/// 命令ID: DataPush (0xBA)
+pub type DataPushResponse = FetchResponse;
+
 /// 创建 Ping 消息
 pub fn create_ping_msg(seq_num: u16) -> Message {
     Message::new(CmdId::Ping, seq_num, vec![])
@@ -632,6 +720,11 @@ pub fn create_ping_msg(seq_num: u16) -> Message {
 /// 创建获取版本消息
 pub fn create_version_msg(seq_num: u16) -> Message {
     Message::new(CmdId::GetVersion, seq_num, vec![])
+}
+
+/// 创建获取共享内存信息消息
+pub fn create_shm_info_msg(seq_num: u16) -> Message {
+    Message::new(CmdId::GetShmInfo, seq_num, vec![])
 }
 
 /// 创建配置消息
@@ -695,8 +788,8 @@ mod tests {
         let config = ConfigRequest::default();
         let payload = config.encode();
 
-        // item_count(1) + sample_div(1) + buffer_depth(2) + items(16*5)
-        assert_eq!(payload.len(), 4 + MAX_ITEMS * 5);
+        // item_count(1) + sample_div(1) + buffer_depth(2) + reserved(4) + items(16*8)
+        assert_eq!(payload.len(), 8 + MAX_ITEMS * 8);
         assert_eq!(payload[0], 4); // 4 items by default
         assert_eq!(payload[1], 1); // sample_div = 1
     }

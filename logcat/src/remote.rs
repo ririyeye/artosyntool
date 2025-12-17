@@ -58,15 +58,25 @@ impl client::Handler for SshHandler {
     }
 }
 
-/// 将单条寄存器记录打包: 8字节时间戳(ms) + 4字节seq_id + 4字节irq_type + N*4字节values
-fn record_to_bytes(ts: u64, record: &TraceRecord) -> Vec<u8> {
-    let mut data = Vec::with_capacity(8 + 4 + 4 + record.values.len() * 4);
+/// 将单条寄存器记录打包:
+/// 8字节时间戳(us) + 4字节seq_id + 2字节irq_type + 2字节valid_mask + raw_data
+fn record_to_bytes(ts_us: u64, record: &TraceRecord) -> Vec<u8> {
+    let mut data = Vec::with_capacity(8 + 4 + 2 + 2 + record.raw_data.len());
+    // 时间戳 (us) - 使用记录的原始时间戳，如果为0则用采集时间
+    let ts = if record.timestamp_us > 0 {
+        record.timestamp_us
+    } else {
+        ts_us * 1000
+    };
     data.extend_from_slice(&ts.to_le_bytes());
+    // seq_id
     data.extend_from_slice(&record.seq_id.to_le_bytes());
+    // irq_type (u16)
     data.extend_from_slice(&record.irq_type.to_le_bytes());
-    for v in &record.values {
-        data.extend_from_slice(&v.to_le_bytes());
-    }
+    // valid_mask (u16)
+    data.extend_from_slice(&record.valid_mask.to_le_bytes());
+    // raw_data
+    data.extend_from_slice(&record.raw_data);
     data
 }
 

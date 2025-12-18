@@ -30,7 +30,8 @@ pub const HEADER_SIZE: usize = 8;
 pub const DEFAULT_PORT: u16 = 12345;
 
 /// 最大配置项数量
-pub const MAX_ITEMS: usize = 16;
+/// 最大配置项数量 (与服务端 REG_TRACE_MAX_ITEMS 保持一致)
+pub const MAX_ITEMS: usize = 64;
 
 /// 单个配置项最大宽度 (共享内存端限制)
 pub const MAX_ITEM_WIDTH: usize = 32;
@@ -44,38 +45,30 @@ pub const MAX_BATCH_RECORDS: usize = 500;
 /// 默认缓冲深度
 pub const DEFAULT_BUFFER_DEPTH: u16 = 100;
 
-/// 记录头大小 (不含data): timestamp_us(8) + seq_id(4) + irq_type(2) + valid_mask(2) + data_len(2)
-pub const RECORD_HEADER_SIZE: usize = 18;
+/// 记录头大小 (不含data): timestamp_us(8) + seq_id(4) + irq_type(2) + data_len(2) + valid_mask(8)
+pub const RECORD_HEADER_SIZE: usize = 24;
 
 /// TCP 命令 ID
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum CmdId {
-    Config = 0xB0,       // 配置抓取项
-    Start = 0xB1,        // 启动抓取
-    Stop = 0xB2,         // 停止抓取
-    QueryStatus = 0xB3,  // 查询缓冲区状态
-    FetchData = 0xB4,    // 拉取数据 (统一使用共享内存)
-    ClearBuffer = 0xB5,  // 清空缓冲区
-    GetShmInfo = 0xB6,   // 获取共享内存信息
-    FetchDataShm = 0xB7, // [别名] 与 FetchData 相同
-    GetVersion = 0xB8,   // 获取版本信息
-    Ping = 0xB9,         // 心跳检测
-    DataPush = 0xBA,     // 服务端主动推送数据
+    Config = 0xB0,   // 配置抓取项（配置后自动推送）
+    Stop = 0xB2,     // 停止采集
+    Status = 0xB3,   // 查询状态
+    ShmInfo = 0xB6,  // 获取共享内存信息
+    Version = 0xB8,  // 获取版本信息
+    Ping = 0xB9,     // 心跳检测
+    DataPush = 0xBA, // 服务端主动推送数据
 }
 
 impl From<u8> for CmdId {
     fn from(v: u8) -> Self {
         match v {
             0xB0 => CmdId::Config,
-            0xB1 => CmdId::Start,
             0xB2 => CmdId::Stop,
-            0xB3 => CmdId::QueryStatus,
-            0xB4 => CmdId::FetchData,
-            0xB5 => CmdId::ClearBuffer,
-            0xB6 => CmdId::GetShmInfo,
-            0xB7 => CmdId::FetchDataShm,
-            0xB8 => CmdId::GetVersion,
+            0xB3 => CmdId::Status,
+            0xB6 => CmdId::ShmInfo,
+            0xB8 => CmdId::Version,
             0xB9 => CmdId::Ping,
             0xBA => CmdId::DataPush,
             _ => CmdId::Ping, // 默认
@@ -95,6 +88,7 @@ pub enum ErrorCode {
     BufferEmpty = -5,
     NoConfig = -6,
     CommFail = -7,
+    TooManyItems = -8, // 合并后配置项超过 RPC 限制(62个)
 }
 
 impl From<i8> for ErrorCode {
@@ -108,6 +102,7 @@ impl From<i8> for ErrorCode {
             -5 => ErrorCode::BufferEmpty,
             -6 => ErrorCode::NoConfig,
             -7 => ErrorCode::CommFail,
+            -8 => ErrorCode::TooManyItems,
             _ => ErrorCode::InvalidCmd,
         }
     }
@@ -124,6 +119,7 @@ impl std::fmt::Display for ErrorCode {
             ErrorCode::BufferEmpty => write!(f, "BUFFER_EMPTY"),
             ErrorCode::NoConfig => write!(f, "NO_CONFIG"),
             ErrorCode::CommFail => write!(f, "COMM_FAIL"),
+            ErrorCode::TooManyItems => write!(f, "TOO_MANY_ITEMS"),
         }
     }
 }
@@ -308,7 +304,7 @@ pub mod irq_type {
     pub const FREQ_SWEEP: u16 = 0x0200;
     pub const ALL: u16 = 0xFFFF;
 
-    /// 将中断类型值转换为名称
+    /// 将中断类型掩码值转换为名称（原有函数，基于掩码值）
     pub fn irq_name(irq_type: u16) -> &'static str {
         match irq_type {
             0x0001 => "RX_BR_END",
@@ -321,6 +317,26 @@ pub mod irq_type {
             0x0080 => "RX_RDOUT",
             0x0100 => "FCH_DEC",
             0x0200 => "FREQ_SWEEP",
+            _ => "UNKNOWN",
+        }
+    }
+
+    /// 将中断类型索引转换为名称（与 Python IRQ_TYPE_NAMES 对应）
+    /// irq_type 值为服务端返回的中断类型索引
+    pub fn irq_index_name(irq_type: u16) -> &'static str {
+        match irq_type {
+            0 => "UNKNOWN",
+            1 => "RX_BR_END",
+            2 => "TX_BR_END",
+            3 => "CSMA_START_ENC",
+            4 => "FSM_STATE_CHG",
+            5 => "FSM_TRX",
+            6 => "SLOT_SOP",
+            7 => "TX_PRE_ENC",
+            8 => "RX_RDOUT",
+            9 => "FCH_DEC",
+            10 => "FREQ_SWEEP",
+            0xFF => "MANUAL",
             _ => "UNKNOWN",
         }
     }
@@ -351,8 +367,62 @@ impl Default for ConfigRequest {
 }
 
 impl ConfigRequest {
+    /// 创建新的配置请求
+    pub fn new(items: Vec<RegTraceItem>, sample_div: u8, buffer_depth: u16) -> Self {
+        Self {
+            items,
+            sample_div,
+            buffer_depth,
+        }
+    }
+
+    /// 创建配置请求并自动拆分超过 MAX_ITEM_WIDTH 的配置项
+    /// 与 Python 的 config() 方法逻辑一致
+    pub fn with_auto_split(
+        items: Vec<RegTraceItem>,
+        sample_div: u8,
+        buffer_depth: u16,
+    ) -> Result<Self, ProtocolError> {
+        let mut split_items = Vec::new();
+
+        for item in items {
+            let mut offset = item.offset;
+            let mut remaining_width = item.width as usize;
+
+            // 自动拆分超过 MAX_ITEM_WIDTH 的配置
+            while remaining_width > MAX_ITEM_WIDTH {
+                split_items.push(RegTraceItem::with_irq_mask(
+                    item.page,
+                    offset,
+                    MAX_ITEM_WIDTH as u8,
+                    item.irq_mask,
+                ));
+                offset = offset.wrapping_add(MAX_ITEM_WIDTH as u8);
+                remaining_width -= MAX_ITEM_WIDTH;
+            }
+            if remaining_width > 0 {
+                split_items.push(RegTraceItem::with_irq_mask(
+                    item.page,
+                    offset,
+                    remaining_width as u8,
+                    item.irq_mask,
+                ));
+            }
+        }
+
+        if split_items.len() > MAX_ITEMS {
+            return Err(ProtocolError::ServerError(ErrorCode::TooManyItems));
+        }
+
+        Ok(Self {
+            items: split_items,
+            sample_div,
+            buffer_depth,
+        })
+    }
+
     /// 编码为消息 payload
-    /// 格式: item_count(1) + sample_div(1) + buffer_depth(2) + reserved(4) + items(16*8)
+    /// 格式: item_count(1) + sample_div(1) + buffer_depth(2) + reserved(4) + items(64*8)
     pub fn encode(&self) -> Vec<u8> {
         let mut payload = Vec::with_capacity(8 + MAX_ITEMS * 8);
 
@@ -397,26 +467,7 @@ impl ConfigResponse {
     }
 }
 
-/// 启动请求
-#[derive(Debug, Clone)]
-pub struct StartRequest {
-    /// bit0: 清空已有数据
-    pub clear_buffer: bool,
-}
-
-impl Default for StartRequest {
-    fn default() -> Self {
-        Self { clear_buffer: true }
-    }
-}
-
-impl StartRequest {
-    pub fn encode(&self) -> Vec<u8> {
-        vec![if self.clear_buffer { 0x01 } else { 0x00 }, 0, 0, 0]
-    }
-}
-
-/// 通用响应 (用于 start/stop/clear)
+/// 通用响应 (用于 stop)
 #[derive(Debug, Clone)]
 pub struct GenericResponse {
     pub result: ErrorCode,
@@ -467,34 +518,6 @@ impl StatusResponse {
     }
 }
 
-/// 拉取数据请求
-#[derive(Debug, Clone)]
-pub struct FetchRequest {
-    pub max_records: u8,
-    /// bit0: 拉取后清除
-    pub clear_after_read: bool,
-}
-
-impl Default for FetchRequest {
-    fn default() -> Self {
-        Self {
-            max_records: 10,
-            clear_after_read: true,
-        }
-    }
-}
-
-impl FetchRequest {
-    pub fn encode(&self) -> Vec<u8> {
-        vec![
-            self.max_records,
-            if self.clear_after_read { 0x01 } else { 0x00 },
-            0,
-            0,
-        ]
-    }
-}
-
 /// 单条采集记录 (新格式：变长、稀疏)
 #[derive(Debug, Clone)]
 pub struct TraceRecord {
@@ -504,8 +527,8 @@ pub struct TraceRecord {
     pub seq_id: u32,
     /// 触发该记录的中断类型 (irq_type_e)
     pub irq_type: u16,
-    /// 有效配置项位图: bit[i]=1 表示 item[i] 数据有效
-    pub valid_mask: u16,
+    /// 有效配置项位图: bit[i]=1 表示 item[i] 数据有效 (64位支持64个配置项)
+    pub valid_mask: u64,
     /// 原始数据 (紧凑排列，按 valid_mask 中置位的配置项顺序)
     pub raw_data: Vec<u8>,
     /// 解析后的值 (兼容旧接口，按 u32 解析)
@@ -517,19 +540,19 @@ impl std::fmt::Display for TraceRecord {
         let values_str: Vec<String> = self.values.iter().map(|v| format!("0x{:08X}", v)).collect();
         write!(
             f,
-            "[{:5}] ts={:12}us irq={:<14} mask=0x{:04X}: {}",
+            "[{:5}] ts={:12}us irq={:<14} mask=0x{:016X}: {}",
             self.seq_id,
             self.timestamp_us,
-            irq_type::irq_name(self.irq_type),
+            irq_type::irq_index_name(self.irq_type),
             self.valid_mask,
             values_str.join(", ")
         )
     }
 }
 
-/// 拉取数据响应 (新格式：变长记录)
+/// 数据推送响应 (服务端主动推送，格式：变长记录)
 #[derive(Debug, Clone)]
-pub struct FetchResponse {
+pub struct DataPushResponse {
     pub result: ErrorCode,
     pub record_count: u8,
     pub item_count: u8,
@@ -537,14 +560,14 @@ pub struct FetchResponse {
     pub records: Vec<TraceRecord>,
 }
 
-impl FetchResponse {
-    /// 从 payload 解析响应 (新变长格式)
+impl DataPushResponse {
+    /// 从 payload 解析响应 (变长格式)
     ///
     /// 响应头格式 (8字节):
     ///   result(1) + reserved(3) + record_count(1) + item_count(1) + remaining_count(2)
     ///
     /// 每条记录格式 (变长):
-    ///   timestamp_us(8) + seq_id(4) + irq_type(2) + valid_mask(2) + data_len(2) + data[data_len]
+    ///   timestamp_us(8) + seq_id(4) + irq_type(2) + data_len(2) + valid_mask(8) + data[data_len]
     pub fn from_payload(data: &[u8]) -> Option<Self> {
         if data.len() < 8 {
             return None;
@@ -583,8 +606,17 @@ impl FetchResponse {
                 data[offset + 11],
             ]);
             let irq_type = u16::from_le_bytes([data[offset + 12], data[offset + 13]]);
-            let valid_mask = u16::from_le_bytes([data[offset + 14], data[offset + 15]]);
-            let data_len = u16::from_le_bytes([data[offset + 16], data[offset + 17]]) as usize;
+            let data_len = u16::from_le_bytes([data[offset + 14], data[offset + 15]]) as usize;
+            let valid_mask = u64::from_le_bytes([
+                data[offset + 16],
+                data[offset + 17],
+                data[offset + 18],
+                data[offset + 19],
+                data[offset + 20],
+                data[offset + 21],
+                data[offset + 22],
+                data[offset + 23],
+            ]);
 
             offset += RECORD_HEADER_SIZE;
 
@@ -708,10 +740,6 @@ impl ShmInfoResponse {
     }
 }
 
-/// 数据推送响应 (服务端主动推送，格式与 FetchResponse 相同)
-/// 命令ID: DataPush (0xBA)
-pub type DataPushResponse = FetchResponse;
-
 /// 创建 Ping 消息
 pub fn create_ping_msg(seq_num: u16) -> Message {
     Message::new(CmdId::Ping, seq_num, vec![])
@@ -719,23 +747,17 @@ pub fn create_ping_msg(seq_num: u16) -> Message {
 
 /// 创建获取版本消息
 pub fn create_version_msg(seq_num: u16) -> Message {
-    Message::new(CmdId::GetVersion, seq_num, vec![])
+    Message::new(CmdId::Version, seq_num, vec![])
 }
 
 /// 创建获取共享内存信息消息
 pub fn create_shm_info_msg(seq_num: u16) -> Message {
-    Message::new(CmdId::GetShmInfo, seq_num, vec![])
+    Message::new(CmdId::ShmInfo, seq_num, vec![])
 }
 
 /// 创建配置消息
 pub fn create_config_msg(seq_num: u16, config: &ConfigRequest) -> Message {
     Message::new(CmdId::Config, seq_num, config.encode())
-}
-
-/// 创建启动消息
-pub fn create_start_msg(seq_num: u16, clear_buffer: bool) -> Message {
-    let req = StartRequest { clear_buffer };
-    Message::new(CmdId::Start, seq_num, req.encode())
 }
 
 /// 创建停止消息
@@ -745,21 +767,7 @@ pub fn create_stop_msg(seq_num: u16) -> Message {
 
 /// 创建状态查询消息
 pub fn create_status_msg(seq_num: u16) -> Message {
-    Message::new(CmdId::QueryStatus, seq_num, vec![])
-}
-
-/// 创建拉取数据消息
-pub fn create_fetch_msg(seq_num: u16, max_records: u8, clear_after_read: bool) -> Message {
-    let req = FetchRequest {
-        max_records,
-        clear_after_read,
-    };
-    Message::new(CmdId::FetchData, seq_num, req.encode())
-}
-
-/// 创建清空缓冲消息
-pub fn create_clear_msg(seq_num: u16) -> Message {
-    Message::new(CmdId::ClearBuffer, seq_num, vec![])
+    Message::new(CmdId::Status, seq_num, vec![])
 }
 
 #[cfg(test)]

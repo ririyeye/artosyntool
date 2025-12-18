@@ -9,6 +9,7 @@ workspace = true
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 bytes = "1.11"
 thiserror = "2.0"
 tracing = "0.1"

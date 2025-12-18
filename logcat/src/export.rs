@@ -31,6 +31,15 @@ pub struct ExportOptions<'a> {
     pub output_dir: &'a str,
 }
 
+/// 创建带序号的文件路径
+fn make_numbered_path(base_dir: &str, name: &str, ext: &str, index: usize) -> String {
+    if index == 0 {
+        format!("{}/{}.{}", base_dir, name, ext)
+    } else {
+        format!("{}/{}_{}.{}", base_dir, name, index, ext)
+    }
+}
+
 pub fn run_export(opts: ExportOptions<'_>) -> Result<()> {
     create_dir_all(opts.output_dir)
         .with_context(|| format!("create export dir {}", opts.output_dir))?;
@@ -42,9 +51,27 @@ pub fn run_export(opts: ExportOptions<'_>) -> Result<()> {
         warn!("logcat export: skipped {} corrupted entries", errors);
     }
 
+    // 统计各通道的条目数
+    let ch0_count = entries.iter().filter(|e| e.channel() == 0).count();
+    let ch1_count = entries.iter().filter(|e| e.channel() == 1).count();
+    let ch1_blocks = entries
+        .iter()
+        .filter(|e| e.channel() == 1 && e.is_block())
+        .count();
+    info!(
+        "logcat export: read {} entries (ch0={}, ch1={} with {} blocks)",
+        entries.len(),
+        ch0_count,
+        ch1_count,
+        ch1_blocks
+    );
+
+    // 文件序号，用于分开导出不同 descriptor 的数据
+    let mut file_index: usize = 0;
+
     let logcat_path = format!("{}/ar_logcat.txt", opts.output_dir);
-    let reg_csv_path = format!("{}/reg_trace.csv", opts.output_dir);
-    let reg_desc_path = format!("{}/reg_descriptor.json", opts.output_dir);
+    let reg_csv_path = make_numbered_path(opts.output_dir, "reg_trace", "csv", file_index);
+    let reg_desc_path = make_numbered_path(opts.output_dir, "reg_descriptor", "json", file_index);
 
     let mut logcat_writer = BufWriter::new(
         File::create(&logcat_path).with_context(|| format!("create {}", logcat_path))?,
@@ -62,6 +89,10 @@ pub fn run_export(opts: ExportOptions<'_>) -> Result<()> {
     let mut reg_rows: u64 = 0;
     let mut logcat_rows: u64 = 0;
     let mut reg_skipped: u64 = 0;
+
+    // 块统计（减少日志）
+    let mut ch1_block_count: u64 = 0;
+    let mut ch1_subrecord_count: u64 = 0;
 
     for entry in entries {
         match entry.channel() {
@@ -93,16 +124,93 @@ pub fn run_export(opts: ExportOptions<'_>) -> Result<()> {
             }
             1 => {
                 // 通道1: 寄存器数据
+                // 检查是否为块模式（BlockWriter 写入的多条记录打包）
+                if entry.is_block() {
+                    // 解包块内的子记录
+                    if let Some(records) = entry.unpack_block() {
+                        ch1_block_count += 1;
+                        ch1_subrecord_count += records.len() as u64;
+                        for (_ts, data) in records {
+                            // 处理每条子记录，检查是否需要创建新文件
+                            let need_new_file = process_reg_data(
+                                &data,
+                                &mut chunk_config,
+                                &mut reg_descriptor,
+                                &mut reg_header_written,
+                                &mut reg_writer,
+                                &mut reg_rows,
+                                &mut reg_skipped,
+                            )?;
+                            if need_new_file {
+                                // 保存当前 descriptor
+                                if let Some(ref desc) = reg_descriptor {
+                                    let json = serde_json::to_string_pretty(desc)?;
+                                    reg_desc_writer.write_all(json.as_bytes())?;
+                                    reg_desc_writer.flush()?;
+                                }
+                                // 创建新文件
+                                file_index += 1;
+                                let new_csv_path = make_numbered_path(
+                                    opts.output_dir,
+                                    "reg_trace",
+                                    "csv",
+                                    file_index,
+                                );
+                                let new_desc_path = make_numbered_path(
+                                    opts.output_dir,
+                                    "reg_descriptor",
+                                    "json",
+                                    file_index,
+                                );
+                                info!(
+                                    "logcat export: creating new files: {}, {}",
+                                    new_csv_path, new_desc_path
+                                );
+                                reg_writer = BufWriter::new(File::create(&new_csv_path)?);
+                                reg_desc_writer = BufWriter::new(File::create(&new_desc_path)?);
+                                reg_header_written = false;
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                debug!(
+                    "logcat export: ch1 non-block, is_text={}, is_binary={}, len={}",
+                    entry.is_text(),
+                    entry.is_binary(),
+                    entry.data.len()
+                );
+
                 if entry.is_text() {
                     // 文本记录是 descriptor JSON (人类可读备份)
                     if let Some(text) = entry.as_text() {
                         match serde_json::from_str::<RegTraceDescriptor>(&text) {
                             Ok(desc) => {
-                                // 新的 descriptor 出现，重置状态
+                                // 新的 descriptor 出现
                                 if reg_descriptor.is_some() {
-                                    info!(
-                                        "logcat export: new descriptor found, resetting CSV header"
+                                    // 保存当前 descriptor 并创建新文件
+                                    if let Some(ref old_desc) = reg_descriptor {
+                                        let json = serde_json::to_string_pretty(old_desc)?;
+                                        reg_desc_writer.write_all(json.as_bytes())?;
+                                        reg_desc_writer.flush()?;
+                                    }
+                                    file_index += 1;
+                                    let new_csv_path = make_numbered_path(
+                                        opts.output_dir,
+                                        "reg_trace",
+                                        "csv",
+                                        file_index,
                                     );
+                                    let new_desc_path = make_numbered_path(
+                                        opts.output_dir,
+                                        "reg_descriptor",
+                                        "json",
+                                        file_index,
+                                    );
+                                    info!("logcat export: new descriptor found, creating new files: {}, {}", new_csv_path, new_desc_path);
+                                    reg_writer = BufWriter::new(File::create(&new_csv_path)?);
+                                    reg_desc_writer = BufWriter::new(File::create(&new_desc_path)?);
                                     reg_header_written = false;
                                 }
                                 reg_descriptor = Some(desc);
@@ -119,87 +227,51 @@ pub fn run_export(opts: ExportOptions<'_>) -> Result<()> {
                     continue;
                 };
 
-                // 检查 Magic 判断 Chunk 类型
-                if data.len() >= 4 {
-                    if data[0..4] == CHUNK_MAGIC_CONFIG {
-                        // Chunk0: 配置描述块
-                        if let Some(cfg) = parse_config_chunk(&data) {
-                            debug!(
-                                "logcat export: parsed Chunk0, {} items, sample_div={}",
-                                cfg.item_count, cfg.sample_div
-                            );
-                            chunk_config = Some(cfg);
-                        } else {
-                            warn!("logcat export: failed to parse Chunk0");
-                        }
-                        continue;
-                    } else if data[0..4] == CHUNK_MAGIC_DATA {
-                        // ChunkN: 数据块
-                        // 优先使用 chunk_config，fallback 到 reg_descriptor
-                        let item_count = chunk_config
-                            .as_ref()
-                            .map(|c| c.item_count as usize)
-                            .or_else(|| reg_descriptor.as_ref().map(|d| d.fields.len()));
-
-                        if item_count.is_none() {
-                            reg_skipped += 1;
-                            continue;
-                        }
-
-                        let records = parse_data_chunk(&data, item_count.unwrap());
-                        if records.is_empty() {
-                            warn!("logcat export: failed to parse ChunkN, len={}", data.len());
-                            continue;
-                        }
-
-                        for (ts, seq_id, irq_type, values) in records {
-                            // 写入 CSV 表头
-                            if !reg_header_written {
-                                let mut header = vec![
-                                    "timestamp".to_string(),
-                                    "seq_id".to_string(),
-                                    "irq_type".to_string(),
-                                ];
-                                if let Some(ref desc) = reg_descriptor {
-                                    header.extend(desc.field_names());
-                                } else if let Some(ref cfg) = chunk_config {
-                                    // 从 chunk_config 生成默认字段名
-                                    for item in cfg.items.iter() {
-                                        header.push(format!(
-                                            "reg_p{}_0x{:02X}",
-                                            item.page, item.offset
-                                        ));
-                                    }
-                                } else {
-                                    for i in 0..values.len() {
-                                        header.push(format!("reg_{}", i));
-                                    }
-                                }
-                                writeln!(reg_writer, "{}", header.join(","))?;
-                                reg_header_written = true;
-                            }
-
-                            // 写入 CSV 行
-                            let row = format_reg_row(ts, seq_id, irq_type, &values);
-                            writeln!(reg_writer, "{}", row)?;
-                            reg_rows += 1;
-                        }
-                        continue;
+                // 处理单条二进制记录
+                let need_new_file = process_reg_data(
+                    &data,
+                    &mut chunk_config,
+                    &mut reg_descriptor,
+                    &mut reg_header_written,
+                    &mut reg_writer,
+                    &mut reg_rows,
+                    &mut reg_skipped,
+                )?;
+                if need_new_file {
+                    // 保存当前 descriptor
+                    if let Some(ref desc) = reg_descriptor {
+                        let json = serde_json::to_string_pretty(desc)?;
+                        reg_desc_writer.write_all(json.as_bytes())?;
+                        reg_desc_writer.flush()?;
                     }
+                    // 创建新文件
+                    file_index += 1;
+                    let new_csv_path =
+                        make_numbered_path(opts.output_dir, "reg_trace", "csv", file_index);
+                    let new_desc_path =
+                        make_numbered_path(opts.output_dir, "reg_descriptor", "json", file_index);
+                    info!(
+                        "logcat export: creating new files: {}, {}",
+                        new_csv_path, new_desc_path
+                    );
+                    reg_writer = BufWriter::new(File::create(&new_csv_path)?);
+                    reg_desc_writer = BufWriter::new(File::create(&new_desc_path)?);
+                    reg_header_written = false;
                 }
-
-                // 未知格式，跳过
-                warn!(
-                    "logcat export: unknown binary format, len={}, skipping",
-                    data.len()
-                );
-                reg_skipped += 1;
             }
             _ => {}
         }
     }
 
-    // 写入 descriptor JSON
+    // 打印块统计
+    if ch1_block_count > 0 {
+        info!(
+            "logcat export: processed {} ch1 blocks with {} sub-records total",
+            ch1_block_count, ch1_subrecord_count
+        );
+    }
+
+    // 写入最后一个 descriptor JSON
     if let Some(desc) = reg_descriptor {
         let json = serde_json::to_string_pretty(&desc)?;
         reg_desc_writer.write_all(json.as_bytes())?;
@@ -216,12 +288,138 @@ pub fn run_export(opts: ExportOptions<'_>) -> Result<()> {
         );
     }
 
-    info!(
-        "logcat export: saved {} logcat lines to {}, {} reg rows to {}",
-        logcat_rows, logcat_path, reg_rows, reg_csv_path
-    );
+    let total_files = file_index + 1;
+    if total_files > 1 {
+        info!(
+            "logcat export: saved {} logcat lines to {}, {} reg rows to {} files (reg_trace.csv ~ reg_trace_{}.csv)",
+            logcat_rows, logcat_path, reg_rows, total_files, file_index
+        );
+    } else {
+        info!(
+            "logcat export: saved {} logcat lines to {}, {} reg rows to {}",
+            logcat_rows,
+            logcat_path,
+            reg_rows,
+            make_numbered_path(opts.output_dir, "reg_trace", "csv", 0)
+        );
+    }
 
     Ok(())
+}
+
+/// 处理单条寄存器二进制数据
+/// 返回 true 表示检测到新 descriptor，需要创建新文件
+fn process_reg_data(
+    data: &[u8],
+    chunk_config: &mut Option<ChunkConfig>,
+    reg_descriptor: &mut Option<RegTraceDescriptor>,
+    reg_header_written: &mut bool,
+    reg_writer: &mut BufWriter<File>,
+    reg_rows: &mut u64,
+    reg_skipped: &mut u64,
+) -> Result<bool> {
+    // 空数据跳过
+    if data.is_empty() {
+        return Ok(false);
+    }
+
+    // 检查是否为 JSON descriptor（以 '{' 开头）
+    // 这处理了 BlockWriter 将文本和二进制混合在一起的情况
+    if data[0] == b'{' {
+        if let Ok(text) = std::str::from_utf8(data) {
+            match serde_json::from_str::<RegTraceDescriptor>(text) {
+                Ok(desc) => {
+                    let need_new_file = reg_descriptor.is_some();
+                    *reg_descriptor = Some(desc);
+                    return Ok(need_new_file);
+                }
+                Err(e) => {
+                    debug!("logcat export: JSON-like data but parse failed: {}", e);
+                }
+            }
+        }
+    }
+
+    // 检查 Magic 判断 Chunk 类型
+    if data.len() >= 4 {
+        if data[0..4] == CHUNK_MAGIC_CONFIG {
+            // Chunk0: 配置描述块
+            if let Some(cfg) = parse_config_chunk(data) {
+                debug!(
+                    "logcat export: parsed Chunk0, {} items, sample_div={}",
+                    cfg.item_count, cfg.sample_div
+                );
+                *chunk_config = Some(cfg);
+            } else {
+                warn!("logcat export: failed to parse Chunk0");
+            }
+            return Ok(false);
+        } else if data[0..4] == CHUNK_MAGIC_DATA {
+            // ChunkN: 数据块
+            // 优先使用 chunk_config，fallback 到 reg_descriptor
+            let item_count = chunk_config
+                .as_ref()
+                .map(|c| c.item_count as usize)
+                .or_else(|| reg_descriptor.as_ref().map(|d| d.fields.len()));
+
+            if item_count.is_none() {
+                *reg_skipped += 1;
+                return Ok(false);
+            }
+
+            let records = parse_data_chunk(data, item_count.unwrap());
+            if records.is_empty() {
+                warn!("logcat export: failed to parse ChunkN, len={}", data.len());
+                return Ok(false);
+            }
+
+            for (ts, seq_id, irq_type, values) in records {
+                // 写入 CSV 表头
+                if !*reg_header_written {
+                    let mut header = vec![
+                        "timestamp".to_string(),
+                        "seq_id".to_string(),
+                        "irq_type".to_string(),
+                    ];
+                    if let Some(ref desc) = reg_descriptor {
+                        header.extend(desc.field_names());
+                    } else if let Some(ref cfg) = chunk_config {
+                        // 从 chunk_config 生成默认字段名
+                        for item in cfg.items.iter() {
+                            header.push(format!("reg_p{}_0x{:02X}", item.page, item.offset));
+                        }
+                    } else {
+                        for i in 0..values.len() {
+                            header.push(format!("reg_{}", i));
+                        }
+                    }
+                    writeln!(reg_writer, "{}", header.join(","))?;
+                    *reg_header_written = true;
+                }
+
+                // 写入 CSV 行
+                let row = format_reg_row(ts, seq_id, irq_type, &values);
+                writeln!(reg_writer, "{}", row)?;
+                *reg_rows += 1;
+            }
+            return Ok(false);
+        }
+    }
+
+    // 未知格式，跳过
+    if data.len() >= 4 {
+        debug!(
+            "logcat export: unknown binary format, len={}, magic=[0x{:02X} 0x{:02X} 0x{:02X} 0x{:02X}], skipping",
+            data.len(), data[0], data[1], data[2], data[3]
+        );
+    } else {
+        debug!(
+            "logcat export: unknown binary format, len={}, skipping",
+            data.len()
+        );
+    }
+    *reg_skipped += 1;
+    Ok(false)
 }
 
 /// 解析 Chunk0 配置描述块
@@ -279,7 +477,7 @@ fn parse_config_chunk(data: &[u8]) -> Option<ChunkConfig> {
 
 /// 解析 ChunkN 数据块
 /// 格式: [MAGIC:4B][record_count:2B][records:...]
-/// 每条记录: ts_us(8) + seq_id(4) + irq_type(2) + valid_mask(2) + raw_data[...]
+/// 每条记录: ts_us(8) + seq_id(4) + irq_type(2) + data_len(2) + valid_mask(8) + raw_data[...]
 fn parse_data_chunk(data: &[u8], item_count: usize) -> Vec<(u64, u32, u32, Vec<u32>)> {
     // 最小长度: 4(magic) + 2(count) = 6
     if data.len() < 6 {
@@ -294,8 +492,8 @@ fn parse_data_chunk(data: &[u8], item_count: usize) -> Vec<(u64, u32, u32, Vec<u
     let record_count = u16::from_le_bytes([data[4], data[5]]) as usize;
     let records_data = &data[6..];
 
-    // 记录头: ts_us(8) + seq_id(4) + irq_type(2) + valid_mask(2) = 16字节
-    const HEADER_SIZE: usize = 16;
+    // 记录头: ts_us(8) + seq_id(4) + irq_type(2) + data_len(2) + valid_mask(8) = 24字节
+    const HEADER_SIZE: usize = 24;
 
     let mut results = Vec::with_capacity(record_count);
     let mut offset = 0;
@@ -329,16 +527,30 @@ fn parse_data_chunk(data: &[u8], item_count: usize) -> Vec<(u64, u32, u32, Vec<u
         let irq_type =
             u16::from_le_bytes([records_data[offset + 12], records_data[offset + 13]]) as u32;
 
-        // 读取 valid_mask (u16)
-        let valid_mask = u16::from_le_bytes([records_data[offset + 14], records_data[offset + 15]]);
+        // 读取 data_len (u16)
+        let data_len =
+            u16::from_le_bytes([records_data[offset + 14], records_data[offset + 15]]) as usize;
+
+        // 读取 valid_mask (u64)
+        let valid_mask = u64::from_le_bytes([
+            records_data[offset + 16],
+            records_data[offset + 17],
+            records_data[offset + 18],
+            records_data[offset + 19],
+            records_data[offset + 20],
+            records_data[offset + 21],
+            records_data[offset + 22],
+            records_data[offset + 23],
+        ]);
 
         offset += HEADER_SIZE;
 
         // 按 valid_mask 读取数据，每个有效项占 4 字节
         let mut values = Vec::with_capacity(item_count);
+        let data_end = offset + data_len;
         for i in 0..item_count {
             if valid_mask & (1 << i) != 0 {
-                if offset + 4 <= records_data.len() {
+                if offset + 4 <= data_end && offset + 4 <= records_data.len() {
                     values.push(u32::from_le_bytes([
                         records_data[offset],
                         records_data[offset + 1],
@@ -353,6 +565,8 @@ fn parse_data_chunk(data: &[u8], item_count: usize) -> Vec<(u64, u32, u32, Vec<u
                 values.push(0); // 该项无效，填充0
             }
         }
+        // 确保跳过整个数据区
+        offset = data_end.max(offset);
 
         results.push((ts_us, seq_id, irq_type, values));
     }
@@ -426,6 +640,7 @@ mod tests {
     #[test]
     fn test_parse_data_chunk() {
         // 构造 ChunkN 数据: 2条记录，每条2个values
+        // 新格式: ts_us(8) + seq_id(4) + irq_type(2) + data_len(2) + valid_mask(8) + data[...]
         let mut data = Vec::new();
 
         // Magic "RTDN"
@@ -436,12 +651,16 @@ mod tests {
         // 记录1
         let ts1: u64 = 1700000000000;
         let seq1: u32 = 0;
-        let irq1: u32 = 0x0001;
+        let irq1: u16 = 0x0001;
+        let valid_mask1: u64 = 0x03; // 两个配置项都有效
         let values1: [u32; 2] = [0x1234, 0x5678];
+        let data_len1: u16 = 8; // 2 * 4 bytes
 
         data.extend_from_slice(&ts1.to_le_bytes());
         data.extend_from_slice(&seq1.to_le_bytes());
         data.extend_from_slice(&irq1.to_le_bytes());
+        data.extend_from_slice(&data_len1.to_le_bytes());
+        data.extend_from_slice(&valid_mask1.to_le_bytes());
         for v in &values1 {
             data.extend_from_slice(&v.to_le_bytes());
         }
@@ -449,12 +668,16 @@ mod tests {
         // 记录2
         let ts2: u64 = 1700000001000;
         let seq2: u32 = 1;
-        let irq2: u32 = 0x0002;
+        let irq2: u16 = 0x0002;
+        let valid_mask2: u64 = 0x03; // 两个配置项都有效
         let values2: [u32; 2] = [0xAAAA, 0xBBBB];
+        let data_len2: u16 = 8;
 
         data.extend_from_slice(&ts2.to_le_bytes());
         data.extend_from_slice(&seq2.to_le_bytes());
         data.extend_from_slice(&irq2.to_le_bytes());
+        data.extend_from_slice(&data_len2.to_le_bytes());
+        data.extend_from_slice(&valid_mask2.to_le_bytes());
         for v in &values2 {
             data.extend_from_slice(&v.to_le_bytes());
         }
@@ -463,11 +686,11 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].0, ts1);
         assert_eq!(records[0].1, seq1);
-        assert_eq!(records[0].2, irq1);
+        assert_eq!(records[0].2, irq1 as u32);
         assert_eq!(records[0].3, values1.to_vec());
         assert_eq!(records[1].0, ts2);
         assert_eq!(records[1].1, seq2);
-        assert_eq!(records[1].2, irq2);
+        assert_eq!(records[1].2, irq2 as u32);
         assert_eq!(records[1].3, values2.to_vec());
     }
 }

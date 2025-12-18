@@ -154,54 +154,14 @@ fn default_buffer_depth() -> u16 {
     100
 }
 
+/// 编译时嵌入的默认配置 JSON
+const DEFAULT_CONFIG_JSON: &str = include_str!("../../example_reg_config.json");
+
 impl Default for RegTraceConfig {
     fn default() -> Self {
-        Self {
-            name: "default".to_string(),
-            description: "默认配置：采集第一页前4个32位寄存器".to_string(),
-            host: default_host(),
-            port: default_port(),
-            sample_div: 1,
-            buffer_depth: 100,
-            items: vec![
-                RegItemConfig {
-                    page: 0,
-                    offset: 0x00,
-                    width: 4,
-                    irq_mask: 0xFFFF,
-                    name: "reg_0x00".to_string(),
-                    description: "页0偏移0x00".to_string(),
-                    unit: "".to_string(),
-                },
-                RegItemConfig {
-                    page: 0,
-                    offset: 0x04,
-                    width: 4,
-                    irq_mask: 0xFFFF,
-                    name: "reg_0x04".to_string(),
-                    description: "页0偏移0x04".to_string(),
-                    unit: "".to_string(),
-                },
-                RegItemConfig {
-                    page: 0,
-                    offset: 0x08,
-                    width: 4,
-                    irq_mask: 0xFFFF,
-                    name: "reg_0x08".to_string(),
-                    description: "页0偏移0x08".to_string(),
-                    unit: "".to_string(),
-                },
-                RegItemConfig {
-                    page: 0,
-                    offset: 0x0C,
-                    width: 4,
-                    irq_mask: 0xFFFF,
-                    name: "reg_0x0C".to_string(),
-                    description: "页0偏移0x0C".to_string(),
-                    unit: "".to_string(),
-                },
-            ],
-        }
+        // 编译时解析 JSON（如果解析失败会 panic）
+        serde_json::from_str(DEFAULT_CONFIG_JSON)
+            .expect("Failed to parse embedded example_reg_config.json")
     }
 }
 
@@ -396,16 +356,19 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = RegTraceConfig::default();
-        assert_eq!(config.items.len(), 4);
-        assert_eq!(config.items[0].page, 0);
-        assert_eq!(config.items[0].offset, 0x00);
+        // 验证从 example_reg_config.json 加载
+        assert_eq!(config.name, "example_regs");
+        assert_eq!(config.items.len(), 23); // 23个默认寄存器
+        assert_eq!(config.items[0].page, 4);
+        assert_eq!(config.items[0].offset, 0x5C);
+        assert_eq!(config.items[0].name, "FSM_CUR_STATE");
     }
 
     #[test]
     fn test_to_config_request() {
         let config = RegTraceConfig::default();
         let req = config.to_config_request();
-        assert_eq!(req.items.len(), 4);
+        assert_eq!(req.items.len(), 23);
         assert_eq!(req.sample_div, 1);
     }
 
@@ -426,6 +389,6 @@ mod tests {
     fn test_descriptor() {
         let config = RegTraceConfig::default();
         let desc = RegTraceDescriptor::from_config(&config);
-        assert_eq!(desc.fields.len(), 4);
+        assert_eq!(desc.fields.len(), 23);
     }
 }

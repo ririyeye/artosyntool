@@ -155,8 +155,11 @@ async fn main() -> Result<()> {
                 info!("logcat: Loading register config from {}", config_path);
                 Some(reg_meta::RegTraceConfig::from_file(config_path)?)
             } else {
-                info!("logcat: No register config provided, will skip register capture");
-                None
+                info!(
+                    "logcat: Using default register config ({} items)",
+                    reg_meta::RegTraceConfig::default().items.len()
+                );
+                Some(reg_meta::RegTraceConfig::default())
             };
 
             remote::run_remote(remote::RemoteOptions {

@@ -21,15 +21,15 @@ fn current_timestamp() -> u64 {
 /// 运行本地模式
 pub async fn run_local(output: &str, cmd: &str, max_size: u64) -> Result<()> {
     // 使用 BlockWriter 进行块压缩写入
-    // 阈值: 4KB 或 500 条记录
-    let mut writer = BlockWriter::new(output, max_size)?;
+    // 阈值: 32KB 或 4000 条记录 (针对 Flash 优化压缩率)
+    let mut writer = BlockWriter::with_threshold(output, max_size, 32 * 1024, 4000)?;
 
     info!(
         "logcat: Recording from '{}' to {} (max {} bytes)",
         cmd, output, max_size
     );
-    info!("logcat: Block compression enabled (4KB/500 records threshold)");
-    info!("logcat: Flush: every 1000 lines or 10s idle");
+    info!("logcat: Block compression enabled (32KB/4000 records threshold)");
+    info!("logcat: Flush: every 4000 lines or 20s idle");
     info!("logcat: Press Ctrl+C to stop");
 
     let running = Arc::new(AtomicBool::new(true));
@@ -72,7 +72,7 @@ pub async fn run_local(output: &str, cmd: &str, max_size: u64) -> Result<()> {
     let mut flush_count = 0u64;
     let mut pending_lines = 0u64;
     let mut last_activity = Instant::now();
-    let idle_timeout = Duration::from_secs(10);
+    let idle_timeout = Duration::from_secs(20);
     let check_interval = Duration::from_millis(100);
 
     loop {
@@ -91,8 +91,8 @@ pub async fn run_local(output: &str, cmd: &str, max_size: u64) -> Result<()> {
                 line_count += 1;
                 pending_lines += 1;
 
-                // 每 1000 行刷新一次
-                if pending_lines >= 1000 {
+                // 每 4000 行刷新一次
+                if pending_lines >= 4000 {
                     writer.flush()?;
                     flush_count += 1;
                     pending_lines = 0;

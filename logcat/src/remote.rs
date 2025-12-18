@@ -11,7 +11,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
+
+/// Logcat 文本通道号
+const LOGCAT_CHANNEL: u8 = 0;
 
 /// 寄存器数据通道号
 const REG_CHANNEL: u8 = 1;
@@ -21,6 +24,14 @@ const RECONNECT_INTERVAL: u64 = 5;
 
 /// 批量写入间隔（秒）
 const FLUSH_INTERVAL: u64 = 10;
+
+/// 批量数据最大字节数
+/// ChunkN 格式: MAGIC(4) + count(2) + records_data
+/// BlockWriter 的 sub-record len 字段是 u16（最大 65535）
+/// 所以 records_data 最大为 65535 - 6 = 65529 字节
+/// 每条 record 48 字节，最多 1365 条
+/// 这里设置为 60KB 以留出一些余量
+const MAX_BATCH_BYTES: usize = 60 * 1024;
 
 /// 远程模式选项
 pub struct RemoteOptions<'a> {
@@ -59,9 +70,9 @@ impl client::Handler for SshHandler {
 }
 
 /// 将单条寄存器记录打包:
-/// 8字节时间戳(us) + 4字节seq_id + 2字节irq_type + 2字节valid_mask + raw_data
+/// 8字节时间戳(us) + 4字节seq_id + 2字节irq_type + 2字节data_len + 8字节valid_mask + raw_data
 fn record_to_bytes(ts_us: u64, record: &TraceRecord) -> Vec<u8> {
-    let mut data = Vec::with_capacity(8 + 4 + 2 + 2 + record.raw_data.len());
+    let mut data = Vec::with_capacity(8 + 4 + 2 + 2 + 8 + record.raw_data.len());
     // 时间戳 (us) - 使用记录的原始时间戳，如果为0则用采集时间
     let ts = if record.timestamp_us > 0 {
         record.timestamp_us
@@ -73,7 +84,9 @@ fn record_to_bytes(ts_us: u64, record: &TraceRecord) -> Vec<u8> {
     data.extend_from_slice(&record.seq_id.to_le_bytes());
     // irq_type (u16)
     data.extend_from_slice(&record.irq_type.to_le_bytes());
-    // valid_mask (u16)
+    // data_len (u16) - raw_data 的长度
+    data.extend_from_slice(&(record.raw_data.len() as u16).to_le_bytes());
+    // valid_mask (u64)
     data.extend_from_slice(&record.valid_mask.to_le_bytes());
     // raw_data
     data.extend_from_slice(&record.raw_data);
@@ -128,13 +141,20 @@ fn pack_data_chunk(records_data: &[u8], record_count: u16) -> Vec<u8> {
 /// 运行远程模式
 pub async fn run_remote(opts: RemoteOptions<'_>) -> Result<()> {
     // 使用 BlockWriter 进行块压缩写入
-    let writer = Arc::new(Mutex::new(BlockWriter::new(opts.output, opts.max_size)?));
+    // 阈值: 32KB 或 4000 条记录 (针对 Flash 优化压缩率，与 local 模式一致)
+    let writer = Arc::new(Mutex::new(BlockWriter::with_threshold(
+        opts.output,
+        opts.max_size,
+        32 * 1024,
+        4000,
+    )?));
     let running = Arc::new(AtomicBool::new(true));
 
     info!(
         "logcat: Recording from remote '{}@{}:{}' to {} (max {} bytes)",
         opts.user, opts.host, opts.ssh_port, opts.output, opts.max_size
     );
+    info!("logcat: Block compression enabled (32KB/4000 records threshold)");
     info!("logcat: SSH command: {}", opts.cmd);
 
     if let Some(ref reg_config) = opts.reg_config {
@@ -312,7 +332,7 @@ async fn run_reg_collector(
     info!("reg: Collector stopped, {} reconnects", reconnect_count);
 }
 
-/// 运行寄存器数据流接收（可中断，批量写入）
+/// 运行寄存器数据流接收（流式推送模式）
 async fn run_reg_stream(
     mut stream: TcpStream,
     config: &RegTraceConfig,
@@ -322,6 +342,10 @@ async fn run_reg_stream(
     reg_count: &Arc<AtomicU64>,
     descriptor_written: &mut bool,
 ) -> Result<()> {
+    use ar_dbg_client::protocol::{DataPushResponse, Message};
+    use bytes::BytesMut;
+    use tokio::io::AsyncReadExt;
+
     // 配置采集项
     let config_req = config.to_config_request();
     info!("reg: Configuring {} items", config_req.items.len());
@@ -335,12 +359,8 @@ async fn run_reg_stream(
         config_resp.actual_items, config_resp.actual_sample_div, config_resp.actual_buffer_depth
     );
 
-    // 启动采集
-    let start_resp = client.start(&mut stream, true).await?;
-    if start_resp.result != ar_dbg_client::ErrorCode::Ok {
-        return Err(anyhow!("Start failed: {}", start_resp.result));
-    }
-    info!("reg: Trace started");
+    // 配置成功后服务端会自动推送数据
+    info!("reg: Streaming mode started (waiting for DATA_PUSH)");
 
     // 首次写入配置描述块 (Chunk0)
     if !*descriptor_written {
@@ -368,7 +388,10 @@ async fn run_reg_stream(
     let mut batch_count: u64 = 0;
     let mut last_flush = Instant::now();
     let flush_interval = Duration::from_secs(FLUSH_INTERVAL);
-    let poll_interval = Duration::from_millis(500);
+
+    // 流式接收缓冲区
+    let mut buf = BytesMut::with_capacity(8192);
+    let mut read_buf = [0u8; 4096];
 
     loop {
         // 检查停止信号
@@ -376,10 +399,22 @@ async fn run_reg_stream(
             info!("reg: Stopping stream due to signal");
             // 写入剩余批量数据 (打包为 ChunkN)
             if !batch.is_empty() {
+                info!("reg: Writing final batch: {} records", batch_count);
                 let data_chunk = pack_data_chunk(&batch, batch_count as u16);
                 let mut w = writer.lock().await;
                 if let Err(e) = w.write_binary_ch(REG_CHANNEL, current_timestamp(), &data_chunk) {
                     error!("reg: Final batch write error: {}", e);
+                }
+                // 确保数据被刷新到文件
+                if let Err(e) = w.flush() {
+                    error!("reg: Final flush error: {}", e);
+                }
+            } else {
+                // 即使 batch 为空，也要 flush BlockWriter 的内部缓冲
+                info!("reg: Flushing BlockWriter (batch empty)");
+                let mut w = writer.lock().await;
+                if let Err(e) = w.flush() {
+                    error!("reg: Final flush error: {}", e);
                 }
             }
             // 发送停止命令
@@ -396,9 +431,13 @@ async fn run_reg_stream(
                 if let Err(e) = w.write_binary_ch(REG_CHANNEL, ts, &data_chunk) {
                     error!("reg: Batch write error: {}", e);
                 }
+                // 刷新 BlockWriter 确保数据写入文件（只刷新寄存器通道）
+                if let Err(e) = w.flush_channel_only(REG_CHANNEL) {
+                    error!("reg: Flush error: {}", e);
+                }
             }
-            debug!(
-                "reg: Flushed {} records ({} bytes)",
+            info!(
+                "reg: Periodic flush: {} records ({} bytes)",
                 batch_count,
                 batch.len()
             );
@@ -407,50 +446,88 @@ async fn run_reg_stream(
             last_flush = Instant::now();
         }
 
-        // 查询状态并拉取数据
-        let status = match client.status(&mut stream).await {
-            Ok(s) => s,
-            Err(e) => {
-                if running.load(Ordering::SeqCst) {
-                    warn!("reg: Status query failed: {}", e);
-                }
-                // 写入剩余批量数据
-                if !batch.is_empty() {
-                    let mut w = writer.lock().await;
-                    let _ = w.write_binary_ch(REG_CHANNEL, current_timestamp(), &batch);
-                }
-                return Err(anyhow!("Status query failed: {}", e));
+        // 使用 select 同时检查停止信号和接收数据
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(100)), if !running.load(Ordering::SeqCst) => {
+                continue;
             }
-        };
+            result = stream.read(&mut read_buf) => {
+                match result {
+                    Ok(0) => {
+                        // 连接关闭
+                        info!("reg: Connection closed by server");
+                        if !batch.is_empty() {
+                            let data_chunk = pack_data_chunk(&batch, batch_count as u16);
+                            let mut w = writer.lock().await;
+                            let _ = w.write_binary_ch(REG_CHANNEL, current_timestamp(), &data_chunk);
+                            let _ = w.flush();
+                        }
+                        return Err(anyhow!("Connection closed by server"));
+                    }
+                    Ok(n) => {
+                        buf.extend_from_slice(&read_buf[..n]);
 
-        if status.record_count > 0 {
-            // 拉取数据
-            match client.fetch(&mut stream, 50, true).await {
-                Ok(fetch_resp) => {
-                    if fetch_resp.result == ar_dbg_client::ErrorCode::Ok {
-                        let ts = current_timestamp();
-                        for record in &fetch_resp.records {
-                            let record_bytes = record_to_bytes(ts, record);
-                            batch.extend_from_slice(&record_bytes);
-                            batch_count += 1;
+                        // 尝试解析消息
+                        while let Some(msg) = Message::decode(&mut buf)? {
+                            if msg.header.cmd_id == ar_dbg_client::CmdId::DataPush {
+                                // 解析推送数据
+                                if let Some(data_resp) = DataPushResponse::from_payload(&msg.payload) {
+                                    if data_resp.result == ar_dbg_client::ErrorCode::Ok {
+                                        let ts = current_timestamp();
+                                        for record in &data_resp.records {
+                                            let record_bytes = record_to_bytes(ts, record);
+                                            batch.extend_from_slice(&record_bytes);
+                                            batch_count += 1;
 
-                            let count = reg_count.fetch_add(1, Ordering::SeqCst) + 1;
-                            if count % 100 == 0 {
-                                eprint!("\rreg: {} records", count);
+                                            let count = reg_count.fetch_add(1, Ordering::SeqCst) + 1;
+                                            if count % 100 == 0 {
+                                                eprint!("\rreg: {} records", count);
+                                            }
+                                        }
+
+                                        // 检查批量大小是否超过限制，如果超过则提前刷新
+                                        if batch.len() >= MAX_BATCH_BYTES {
+                                            let ts = current_timestamp();
+                                            let data_chunk = pack_data_chunk(&batch, batch_count as u16);
+                                            {
+                                                let mut w = writer.lock().await;
+                                                if let Err(e) = w.write_binary_ch(REG_CHANNEL, ts, &data_chunk) {
+                                                    error!("reg: Batch write error (size limit): {}", e);
+                                                }
+                                                // 只刷新寄存器通道
+                                                if let Err(e) = w.flush_channel_only(REG_CHANNEL) {
+                                                    error!("reg: Flush error (size limit): {}", e);
+                                                }
+                                            }
+                                            info!(
+                                                "reg: Size-triggered flush: {} records ({} bytes)",
+                                                batch_count,
+                                                batch.len()
+                                            );
+                                            batch.clear();
+                                            batch_count = 0;
+                                            last_flush = Instant::now();
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
-                }
-                Err(e) => {
-                    if running.load(Ordering::SeqCst) {
-                        warn!("reg: Fetch failed: {}", e);
+                    Err(e) => {
+                        if running.load(Ordering::SeqCst) {
+                            warn!("reg: Read error: {}", e);
+                        }
+                        if !batch.is_empty() {
+                            let data_chunk = pack_data_chunk(&batch, batch_count as u16);
+                            let mut w = writer.lock().await;
+                            let _ = w.write_binary_ch(REG_CHANNEL, current_timestamp(), &data_chunk);
+                            let _ = w.flush();
+                        }
+                        return Err(anyhow!("Read error: {}", e));
                     }
                 }
             }
         }
-
-        // 等待下次轮询
-        tokio::time::sleep(poll_interval).await;
     }
 }
 
@@ -600,11 +677,11 @@ async fn run_ssh_logcat(
                             }
                         }
 
-                        // 每 1000 行刷新一次
+                        // 每 1000 行刷新一次（只刷新 logcat 通道）
                         if pending_lines >= 1000 {
                             {
                                 let mut w = writer.lock().await;
-                                if let Err(e) = w.flush() {
+                                if let Err(e) = w.flush_channel_only(LOGCAT_CHANNEL) {
                                     error!("logcat: Flush error: {}", e);
                                 }
                             }
@@ -639,11 +716,11 @@ async fn run_ssh_logcat(
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                // 检查是否有未刷新的数据且超时
+                // 检查是否有未刷新的数据且超时（只刷新 logcat 通道）
                 if pending_lines > 0 && last_activity.elapsed() >= idle_timeout {
                     {
                         let mut w = writer.lock().await;
-                        if let Err(e) = w.flush() {
+                        if let Err(e) = w.flush_channel_only(LOGCAT_CHANNEL) {
                             error!("logcat: Idle flush error: {}", e);
                         }
                     }

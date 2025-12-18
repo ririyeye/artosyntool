@@ -60,7 +60,7 @@ impl LogcatSimulator {
             buffer: Vec::with_capacity(1000),
             last_flush_line_count: 0,
             last_timestamp: 0,
-            flush_line_threshold: 1000, // 1000 行刷新
+            flush_line_threshold: 1000,      // 1000 行刷新
             flush_time_threshold_ms: 10_000, // 10s 空闲刷新
         })
     }
@@ -202,7 +202,8 @@ fn test_logcat_simulation() {
     let max_rslog_size: u64 = 5 * 1024 * 1024; // 5MB 足够存储测试日志
 
     {
-        let mut simulator = LogcatSimulator::new(&rslog_path, max_rslog_size).expect("创建写入器失败");
+        let mut simulator =
+            LogcatSimulator::new(&rslog_path, max_rslog_size).expect("创建写入器失败");
 
         for (ts, line) in &parsed_lines {
             simulator.write_line(*ts, line).expect("写入失败");
@@ -213,8 +214,16 @@ fn test_logcat_simulation() {
         let stats = simulator.stats();
         println!("   写入完成: 耗时 {:?}", start.elapsed());
         println!("   rslog 统计:");
-        println!("     - 最大容量: {} 字节 ({:.1} KB)", stats.max_size, stats.max_size as f64 / 1024.0);
-        println!("     - 已用空间: {} 字节 ({:.1} KB)", stats.used_size, stats.used_size as f64 / 1024.0);
+        println!(
+            "     - 最大容量: {} 字节 ({:.1} KB)",
+            stats.max_size,
+            stats.max_size as f64 / 1024.0
+        );
+        println!(
+            "     - 已用空间: {} 字节 ({:.1} KB)",
+            stats.used_size,
+            stats.used_size as f64 / 1024.0
+        );
         println!("     - 总条目数: {}", stats.global_seq);
     }
 
@@ -226,26 +235,45 @@ fn test_logcat_simulation() {
     };
     let gz_file_size = fs::metadata(&gz_path).expect("获取 gz 文件大小失败").len();
 
-    println!("   原始文本大小: {} 字节 ({:.1} KB)", original_bytes, original_bytes as f64 / 1024.0);
-    println!("   gzip 压缩后: {} 字节 ({:.1} KB)", gz_file_size, gz_file_size as f64 / 1024.0);
-    println!("   rslog 实际使用: {} 字节 ({:.1} KB)", rslog_used_size, rslog_used_size as f64 / 1024.0);
+    println!(
+        "   原始文本大小: {} 字节 ({:.1} KB)",
+        original_bytes,
+        original_bytes as f64 / 1024.0
+    );
+    println!(
+        "   gzip 压缩后: {} 字节 ({:.1} KB)",
+        gz_file_size,
+        gz_file_size as f64 / 1024.0
+    );
+    println!(
+        "   rslog 实际使用: {} 字节 ({:.1} KB)",
+        rslog_used_size,
+        rslog_used_size as f64 / 1024.0
+    );
     println!();
-    
+
     let rslog_ratio = original_bytes as f64 / rslog_used_size as f64;
     let gzip_ratio = original_bytes as f64 / gz_file_size as f64;
     let rslog_vs_gzip = rslog_used_size as f64 / gz_file_size as f64;
-    
+
     println!("   压缩比:");
     println!("     - rslog 压缩比: {:.2}x (原始/rslog)", rslog_ratio);
     println!("     - gzip 压缩比: {:.2}x (原始/gzip)", gzip_ratio);
-    println!("     - rslog vs gzip: {:.2}x (rslog 是 gzip 的 {:.1}%)", 
-             rslog_vs_gzip, rslog_vs_gzip * 100.0);
+    println!(
+        "     - rslog vs gzip: {:.2}x (rslog 是 gzip 的 {:.1}%)",
+        rslog_vs_gzip,
+        rslog_vs_gzip * 100.0
+    );
 
     // 5. 还原日志并对比
     println!("\n5. 还原日志并对比...");
     let start = Instant::now();
     let restored_lines = restore_logs(&rslog_path).expect("还原失败");
-    println!("   还原完成: {} 行, 耗时 {:?}", restored_lines.len(), start.elapsed());
+    println!(
+        "   还原完成: {} 行, 耗时 {:?}",
+        restored_lines.len(),
+        start.elapsed()
+    );
 
     // 对比行数
     if restored_lines.len() != parsed_lines.len() {
@@ -363,29 +391,41 @@ fn test_compression_comparison() {
         ("BlockWriter 16KB/2000行", true, 16384, 2000),
     ];
 
-    println!("原始数据: {} 行, {} 字节 ({:.1} KB)\n", 
-             parsed_lines.len(), original_bytes, original_bytes as f64 / 1024.0);
+    println!(
+        "原始数据: {} 行, {} 字节 ({:.1} KB)\n",
+        parsed_lines.len(),
+        original_bytes,
+        original_bytes as f64 / 1024.0
+    );
 
-    println!("{:<30} {:>12} {:>12} {:>10}", "配置", "使用空间", "压缩比", "耗时");
+    println!(
+        "{:<30} {:>12} {:>12} {:>10}",
+        "配置", "使用空间", "压缩比", "耗时"
+    );
     println!("{:-<66}", "");
 
     for (name, use_block, block_size, max_records) in configs {
-        let rslog_path = test_log_dir.join(format!("test_config_{}.dat", name.replace(" ", "_").replace("/", "_")));
+        let rslog_path = test_log_dir.join(format!(
+            "test_config_{}.dat",
+            name.replace(" ", "_").replace("/", "_")
+        ));
         let _ = fs::remove_file(&rslog_path);
 
         let start = Instant::now();
         let max_size: u64 = 5 * 1024 * 1024;
 
         let used_size = if use_block {
-            let mut writer = BlockWriter::with_threshold(&rslog_path, max_size, block_size, max_records)
-                .expect("创建 BlockWriter 失败");
+            let mut writer =
+                BlockWriter::with_threshold(&rslog_path, max_size, block_size, max_records)
+                    .expect("创建 BlockWriter 失败");
             for (ts, line) in &parsed_lines {
                 writer.write_text_ch(0, *ts, line).expect("写入失败");
             }
             writer.sync().expect("同步失败");
             writer.stats().used_size
         } else {
-            let mut writer = rslog::StreamWriter::new(&rslog_path, max_size).expect("创建 StreamWriter 失败");
+            let mut writer =
+                rslog::StreamWriter::new(&rslog_path, max_size).expect("创建 StreamWriter 失败");
             for (ts, line) in &parsed_lines {
                 writer.write_text_ch(0, *ts, line).expect("写入失败");
             }

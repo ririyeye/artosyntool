@@ -22,14 +22,15 @@
 //!     let resp = client.ping(&mut stream).await.unwrap();
 //!     println!("Uptime: {} seconds", resp.uptime_sec);
 //!     
-//!     // 配置并启动（默认第一页寄存器）
-//!     client.start_trace_default(&mut stream).await.unwrap();
+//!     // 配置（配置后服务端自动推送数据）
+//!     client.config_default(&mut stream).await.unwrap();
 //!     
-//!     // 拉取数据
-//!     let data = client.fetch(&mut stream, 10, true).await.unwrap();
-//!     for record in &data.records {
-//!         println!("{}", record);
-//!     }
+//!     // 流式接收推送数据
+//!     client.run_streaming(&mut stream, |records| {
+//!         for record in records {
+//!             println!("{}", record);
+//!         }
+//!     }).await.unwrap();
 //! }
 //! ```
 
@@ -38,8 +39,8 @@ pub mod protocol;
 
 pub use client::{ClientConfig, ClientError, RegTraceClient};
 pub use protocol::{
-    irq_type, CmdId, ConfigRequest, ConfigResponse, DataPushResponse, ErrorCode, FetchRequest,
-    FetchResponse, GenericResponse, Message, PingResponse, RegTraceItem, ShmInfoResponse,
-    StatusResponse, TraceRecord, VersionResponse, DEFAULT_PORT, MAX_BATCH_RECORDS, MAX_ITEMS,
-    MAX_ITEM_WIDTH, MAX_RECORD_DATA, PROTOCOL_VERSION, RECORD_HEADER_SIZE,
+    irq_type, CmdId, ConfigRequest, ConfigResponse, DataPushResponse, ErrorCode, GenericResponse,
+    Message, PingResponse, RegTraceItem, ShmInfoResponse, StatusResponse, TraceRecord,
+    VersionResponse, DEFAULT_PORT, MAX_BATCH_RECORDS, MAX_ITEMS, MAX_ITEM_WIDTH, MAX_RECORD_DATA,
+    PROTOCOL_VERSION, RECORD_HEADER_SIZE,
 };

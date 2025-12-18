@@ -155,19 +155,6 @@ impl RegTraceClient {
             .ok_or(ClientError::Protocol(ProtocolError::InvalidMagic))
     }
 
-    /// 启动采集
-    pub async fn start(
-        &self,
-        stream: &mut TcpStream,
-        clear_buffer: bool,
-    ) -> Result<GenericResponse, ClientError> {
-        let msg = create_start_msg(self.next_seq(), clear_buffer);
-        let resp = self.request(stream, msg).await?;
-
-        GenericResponse::from_payload(&resp.payload)
-            .ok_or(ClientError::Protocol(ProtocolError::InvalidMagic))
-    }
-
     /// 停止采集
     pub async fn stop(&self, stream: &mut TcpStream) -> Result<GenericResponse, ClientError> {
         let msg = create_stop_msg(self.next_seq());
@@ -186,31 +173,10 @@ impl RegTraceClient {
             .ok_or(ClientError::Protocol(ProtocolError::InvalidMagic))
     }
 
-    /// 拉取数据
-    pub async fn fetch(
-        &self,
-        stream: &mut TcpStream,
-        max_records: u8,
-        clear_after_read: bool,
-    ) -> Result<FetchResponse, ClientError> {
-        let msg = create_fetch_msg(self.next_seq(), max_records, clear_after_read);
-        let resp = self.request(stream, msg).await?;
-
-        FetchResponse::from_payload(&resp.payload)
-            .ok_or(ClientError::Protocol(ProtocolError::InvalidMagic))
-    }
-
-    /// 清空缓冲区
-    pub async fn clear(&self, stream: &mut TcpStream) -> Result<GenericResponse, ClientError> {
-        let msg = create_clear_msg(self.next_seq());
-        let resp = self.request(stream, msg).await?;
-
-        GenericResponse::from_payload(&resp.payload)
-            .ok_or(ClientError::Protocol(ProtocolError::InvalidMagic))
-    }
-
-    /// 配置并启动采集（默认配置：第一页寄存器）
-    pub async fn start_trace_default(&self, stream: &mut TcpStream) -> Result<(), ClientError> {
+    /// 配置并开始流式接收（默认配置：第一页寄存器）
+    ///
+    /// 配置成功后服务端会自动推送数据，无需手动启动
+    pub async fn config_default(&self, stream: &mut TcpStream) -> Result<(), ClientError> {
         // 使用默认配置（第一页的寄存器）
         let config = ConfigRequest::default();
 
@@ -224,47 +190,163 @@ impl RegTraceClient {
             return Err(ClientError::ServerError(config_resp.result));
         }
         info!(
-            "Config OK: items={}, sample_div={}, buffer_depth={}",
+            "Config OK: items={}, sample_div={}, buffer_depth={} - auto push started",
             config_resp.actual_items,
             config_resp.actual_sample_div,
             config_resp.actual_buffer_depth
         );
 
-        // 启动采集
-        let start_resp = self.start(stream, true).await?;
-        if start_resp.result != ErrorCode::Ok {
-            error!("Start failed: {}", start_resp.result);
-            return Err(ClientError::ServerError(start_resp.result));
-        }
-        info!("Trace started");
-
         Ok(())
     }
-
-    /// 持续监控模式
-    pub async fn monitor(
+    /// 获取共享内存信息
+    pub async fn get_shm_info(
         &self,
         stream: &mut TcpStream,
-        interval_ms: u64,
-        max_records: u8,
-        mut on_record: impl FnMut(&TraceRecord),
-    ) -> Result<(), ClientError> {
-        info!("Starting monitor mode (interval={}ms)", interval_ms);
+    ) -> Result<ShmInfoResponse, ClientError> {
+        let msg = create_shm_info_msg(self.next_seq());
+        let resp = self.request(stream, msg).await?;
+
+        ShmInfoResponse::from_payload(&resp.payload)
+            .ok_or(ClientError::Protocol(ProtocolError::InvalidMagic))
+    }
+
+    /// 流式接收模式 - 配置后自动接收服务端推送的数据
+    ///
+    /// 配置成功后，服务端会通过 DATA_PUSH (0xBA) 命令主动推送数据。
+    /// 此方法会持续接收推送的数据并调用回调函数处理。
+    ///
+    /// # Arguments
+    /// * `stream` - TCP 连接流
+    /// * `on_records` - 数据回调函数，接收一批 TraceRecord
+    ///
+    /// # Returns
+    /// * `Ok(total_records)` - 总共接收的记录数（当连接关闭时）
+    /// * `Err(ClientError)` - 发生错误时
+    pub async fn run_streaming<F>(
+        &self,
+        stream: &mut TcpStream,
+        mut on_records: F,
+    ) -> Result<u64, ClientError>
+    where
+        F: FnMut(&[TraceRecord]),
+    {
+        info!("Streaming mode started");
+
+        let mut total_records: u64 = 0;
+        let mut buf = BytesMut::with_capacity(8192);
+        let mut read_buf = [0u8; 4096];
 
         loop {
-            // 查询状态
-            let status = self.status(stream).await?;
-            if status.record_count > 0 {
-                // 拉取数据
-                let fetch_resp = self.fetch(stream, max_records, true).await?;
-                if fetch_resp.result == ErrorCode::Ok {
-                    for record in &fetch_resp.records {
-                        on_record(record);
+            // 等待数据，使用较长的超时时间（或无限等待）
+            let result = timeout(Duration::from_millis(500), stream.read(&mut read_buf)).await;
+
+            match result {
+                Ok(Ok(0)) => {
+                    // 连接关闭
+                    info!(
+                        "Connection closed by server. Total records: {}",
+                        total_records
+                    );
+                    break;
+                }
+                Ok(Ok(n)) => {
+                    buf.extend_from_slice(&read_buf[..n]);
+                    debug!("Received {} bytes, buffer size: {}", n, buf.len());
+
+                    // 尝试解析消息
+                    while let Some(msg) = Message::decode(&mut buf)? {
+                        if msg.header.cmd_id == CmdId::DataPush {
+                            // 解析推送数据（格式与 FetchResponse 相同）
+                            if let Some(data_resp) = DataPushResponse::from_payload(&msg.payload) {
+                                if data_resp.result == ErrorCode::Ok
+                                    && !data_resp.records.is_empty()
+                                {
+                                    total_records += data_resp.records.len() as u64;
+                                    on_records(&data_resp.records);
+                                }
+                            }
+                        } else {
+                            debug!(
+                                "Received non-push message: {:?} (seq={})",
+                                msg.header.cmd_id, msg.header.seq_num
+                            );
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    error!("Read error: {}", e);
+                    return Err(ClientError::ConnectionFailed(e));
+                }
+                Err(_) => {
+                    // 超时，继续等待
+                    continue;
+                }
+            }
+        }
+
+        Ok(total_records)
+    }
+
+    /// 流式接收模式（带取消信号）
+    ///
+    /// 与 `run_streaming` 类似，但支持通过 `cancel_token` 取消。
+    ///
+    /// # Arguments
+    /// * `stream` - TCP 连接流
+    /// * `cancel_token` - 取消信号
+    /// * `on_records` - 数据回调函数
+    pub async fn run_streaming_with_cancel<F>(
+        &self,
+        stream: &mut TcpStream,
+        cancel_token: tokio_util::sync::CancellationToken,
+        mut on_records: F,
+    ) -> Result<u64, ClientError>
+    where
+        F: FnMut(&[TraceRecord]),
+    {
+        info!("Streaming mode started (with cancel token)");
+
+        let mut total_records: u64 = 0;
+        let mut buf = BytesMut::with_capacity(8192);
+        let mut read_buf = [0u8; 4096];
+
+        loop {
+            tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    info!("Streaming cancelled. Total records: {}", total_records);
+                    // 发送停止命令
+                    let _ = self.stop(stream).await;
+                    break;
+                }
+                result = stream.read(&mut read_buf) => {
+                    match result {
+                        Ok(0) => {
+                            info!("Connection closed by server. Total records: {}", total_records);
+                            break;
+                        }
+                        Ok(n) => {
+                            buf.extend_from_slice(&read_buf[..n]);
+
+                            while let Some(msg) = Message::decode(&mut buf)? {
+                                if msg.header.cmd_id == CmdId::DataPush {
+                                    if let Some(data_resp) = DataPushResponse::from_payload(&msg.payload) {
+                                        if data_resp.result == ErrorCode::Ok && !data_resp.records.is_empty() {
+                                            total_records += data_resp.records.len() as u64;
+                                            on_records(&data_resp.records);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("Read error: {}", e);
+                            return Err(ClientError::ConnectionFailed(e));
+                        }
                     }
                 }
             }
-
-            tokio::time::sleep(Duration::from_millis(interval_ms)).await;
         }
+
+        Ok(total_records)
     }
 }

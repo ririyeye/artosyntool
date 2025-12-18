@@ -14,7 +14,9 @@ lz4_flex = "0.12"
 # CRC32 校验 - 用于数据完整性验证
 crc32fast = "1.5"
 
-
+[dev-dependencies]
+# gzip 解压 - 用于测试
+flate2 = "1.0"
 
 [features]
 default = []

@@ -3,7 +3,7 @@
 use crate::reg_meta::{RegTraceConfig, RegTraceDescriptor, CHUNK_MAGIC_CONFIG, CHUNK_MAGIC_DATA};
 use anyhow::{anyhow, Result};
 use ar_dbg_client::{ClientConfig, RegTraceClient, TraceRecord};
-use rslog::StreamWriter;
+use rslog::BlockWriter;
 use russh::client;
 use russh::keys::PrivateKeyWithHashAlg;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -127,7 +127,8 @@ fn pack_data_chunk(records_data: &[u8], record_count: u16) -> Vec<u8> {
 
 /// 运行远程模式
 pub async fn run_remote(opts: RemoteOptions<'_>) -> Result<()> {
-    let writer = Arc::new(Mutex::new(StreamWriter::new(opts.output, opts.max_size)?));
+    // 使用 BlockWriter 进行块压缩写入
+    let writer = Arc::new(Mutex::new(BlockWriter::new(opts.output, opts.max_size)?));
     let running = Arc::new(AtomicBool::new(true));
 
     info!(
@@ -233,7 +234,7 @@ async fn run_reg_collector(
     host: &str,
     port: u16,
     config: RegTraceConfig,
-    writer: Arc<Mutex<StreamWriter>>,
+    writer: Arc<Mutex<BlockWriter>>,
     running: Arc<AtomicBool>,
     reg_count: Arc<AtomicU64>,
 ) {
@@ -316,7 +317,7 @@ async fn run_reg_stream(
     mut stream: TcpStream,
     config: &RegTraceConfig,
     client: &RegTraceClient,
-    writer: &Arc<Mutex<StreamWriter>>,
+    writer: &Arc<Mutex<BlockWriter>>,
     running: &Arc<AtomicBool>,
     reg_count: &Arc<AtomicU64>,
     descriptor_written: &mut bool,
@@ -461,7 +462,7 @@ async fn run_ssh_logcat(
     password: Option<String>,
     key_path: Option<String>,
     cmd: &str,
-    writer: Arc<Mutex<StreamWriter>>,
+    writer: Arc<Mutex<BlockWriter>>,
     running: Arc<AtomicBool>,
     _logcat_count: &AtomicU64,
 ) {

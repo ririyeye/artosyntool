@@ -67,7 +67,17 @@ pub fn run_export(opts: ExportOptions<'_>) -> Result<()> {
         match entry.channel() {
             0 => {
                 // 通道0: logcat 文本
-                if let Some(text) = entry.as_text() {
+                // 检查是否为块模式
+                if entry.is_block() {
+                    // 解包块内的子记录
+                    if let Some(records) = entry.unpack_block() {
+                        for (ts, data) in records {
+                            let line = String::from_utf8_lossy(&data);
+                            writeln!(logcat_writer, "[{}] {}", ts, line.trim_end())?;
+                            logcat_rows += 1;
+                        }
+                    }
+                } else if let Some(text) = entry.as_text() {
                     writeln!(logcat_writer, "[{}] {}", entry.timestamp_ms, text)?;
                     logcat_rows += 1;
                 } else if let Some(data) = entry.as_binary() {

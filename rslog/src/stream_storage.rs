@@ -53,6 +53,7 @@ const ENTRY_OVERHEAD: usize = ENTRY_HEADER_SIZE + ENTRY_FOOTER_SIZE;
 /// ```text
 ///   高4位 = 通道号 (0-15)
 ///   低4位 = 类型+压缩标记
+///     bit 3: 0=单条, 1=块(多条打包)
 ///     bit 2: 0=文本, 1=二进制
 ///     bit 0: 0=未压缩, 1=已压缩
 /// ```
@@ -62,10 +63,16 @@ const ENTRY_OVERHEAD: usize = ENTRY_HEADER_SIZE + ENTRY_FOOTER_SIZE;
 /// - 0x04: 通道0, 二进制, 未压缩
 /// - 0x14: 通道1, 二进制, 未压缩
 /// - 0x25: 通道2, 二进制, 压缩
+/// - 0x09: 通道0, 文本块, 压缩
+/// - 0x0D: 通道0, 二进制块, 压缩
 const FLAG_BINARY: u8 = 0x04; // bit 2: 二进制类型
 const FLAG_COMPRESSED: u8 = 0x01; // bit 0: 已压缩
+const FLAG_BLOCK: u8 = 0x08; // bit 3: 块模式（多条打包）
 const CHANNEL_SHIFT: u8 = 4; // 通道号在高4位
 const CHANNEL_MASK: u8 = 0xF0; // 通道号掩码
+
+/// 块内子记录头大小: 相对时间戳(2B) + 数据长度(2B)
+const BLOCK_RECORD_HEADER_SIZE: usize = 4;
 
 /// 文件头
 #[derive(Debug, Clone)]
@@ -186,6 +193,15 @@ impl StreamEntry {
         }
     }
 
+    /// 是否为块模式（多条记录打包）
+    pub fn is_block(&self) -> bool {
+        if self.data.is_empty() {
+            false
+        } else {
+            self.data[0] & FLAG_BLOCK != 0
+        }
+    }
+
     /// 获取原始数据（自动解压）
     pub fn get_data(&self) -> Vec<u8> {
         if self.data.len() <= 1 {
@@ -217,6 +233,48 @@ impl StreamEntry {
             return None;
         }
         Some(self.get_data())
+    }
+
+    /// 解析块内的子记录
+    /// 块格式: [base_ts:8B][子记录1][子记录2]...
+    /// 子记录格式: [相对时间戳:2B][数据长度:2B][数据:NB]
+    /// 返回: Vec<(绝对时间戳, 数据)>
+    pub fn unpack_block(&self) -> Option<Vec<(u64, Vec<u8>)>> {
+        if !self.is_block() {
+            return None;
+        }
+
+        let raw = self.get_data();
+        if raw.len() < 8 {
+            return None;
+        }
+
+        // 读取基准时间戳
+        let base_ts = u64::from_le_bytes([
+            raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+        ]);
+
+        let mut records = Vec::new();
+        let mut offset = 8;
+
+        while offset + BLOCK_RECORD_HEADER_SIZE <= raw.len() {
+            // 读取相对时间戳 (ms, 2B)
+            let rel_ts = u16::from_le_bytes([raw[offset], raw[offset + 1]]) as u64;
+            // 读取数据长度 (2B)
+            let data_len = u16::from_le_bytes([raw[offset + 2], raw[offset + 3]]) as usize;
+            offset += BLOCK_RECORD_HEADER_SIZE;
+
+            if offset + data_len > raw.len() {
+                break;
+            }
+
+            let data = raw[offset..offset + data_len].to_vec();
+            let abs_ts = base_ts + rel_ts;
+            records.push((abs_ts, data));
+            offset += data_len;
+        }
+
+        Some(records)
     }
 
     /// 计算总大小（包括头尾）
@@ -838,6 +896,220 @@ impl StreamWriter {
 
     pub fn log_mut(&mut self) -> &mut StreamLog {
         &mut self.log
+    }
+}
+
+/// 块内缓冲的子记录
+struct BlockRecord {
+    rel_ts: u16,   // 相对时间戳 (ms)
+    data: Vec<u8>, // 原始数据
+}
+
+/// 块写入器 - 缓冲多条记录后批量压缩写入
+///
+/// 相比 StreamWriter，BlockWriter 会在内存中缓冲多条记录，
+/// 达到阈值后一次性压缩整块写入，能显著提高重复数据的压缩率。
+///
+/// 块格式（压缩前）:
+/// ```text
+/// [base_ts:8B][子记录1][子记录2]...
+/// 子记录: [rel_ts:2B][len:2B][data:NB]
+/// ```
+pub struct BlockWriter {
+    log: StreamLog,
+    /// 每个通道的缓冲区: (base_ts, records, total_bytes, is_binary)
+    channel_buffers: [(Option<u64>, Vec<BlockRecord>, usize, bool); 16],
+    /// 缓冲区大小阈值（字节）
+    block_size_threshold: usize,
+    /// 最大记录数阈值
+    max_records: usize,
+}
+
+impl BlockWriter {
+    /// 创建块写入器
+    ///
+    /// - `block_size_threshold`: 缓冲区达到此大小后自动刷新（默认 4KB）
+    /// - `max_records`: 缓冲区达到此记录数后自动刷新（默认 500）
+    pub fn new<P: AsRef<Path>>(path: P, max_size: u64) -> io::Result<Self> {
+        Self::with_threshold(path, max_size, 4 * 1024, 500)
+    }
+
+    pub fn with_threshold<P: AsRef<Path>>(
+        path: P,
+        max_size: u64,
+        block_size_threshold: usize,
+        max_records: usize,
+    ) -> io::Result<Self> {
+        let log = StreamLog::open(path, Some(max_size))?;
+        Ok(Self {
+            log,
+            channel_buffers: Default::default(),
+            block_size_threshold,
+            max_records,
+        })
+    }
+
+    /// 写入二进制数据到缓冲区
+    pub fn write_binary_ch(
+        &mut self,
+        channel: u8,
+        timestamp_ms: u64,
+        data: &[u8],
+    ) -> io::Result<u64> {
+        let ch = (channel & 0x0F) as usize;
+        let buf = &mut self.channel_buffers[ch];
+
+        // 如果缓冲区为空，记录基准时间戳
+        if buf.0.is_none() {
+            buf.0 = Some(timestamp_ms);
+            buf.3 = true; // is_binary
+        }
+
+        let base_ts = buf.0.unwrap();
+        // 计算相对时间戳，限制在 u16 范围内（最大 65535ms ≈ 65秒）
+        let rel_ts = timestamp_ms.saturating_sub(base_ts).min(65535) as u16;
+
+        buf.1.push(BlockRecord {
+            rel_ts,
+            data: data.to_vec(),
+        });
+        buf.2 += BLOCK_RECORD_HEADER_SIZE + data.len();
+
+        // 检查是否需要刷新
+        if buf.2 >= self.block_size_threshold || buf.1.len() >= self.max_records {
+            self.flush_channel(channel)?;
+        }
+
+        Ok(0) // 块模式下序列号在刷新时分配
+    }
+
+    /// 写入文本数据到缓冲区
+    pub fn write_text_ch(&mut self, channel: u8, timestamp_ms: u64, text: &str) -> io::Result<u64> {
+        let ch = (channel & 0x0F) as usize;
+        let buf = &mut self.channel_buffers[ch];
+
+        // 如果缓冲区为空，记录基准时间戳
+        if buf.0.is_none() {
+            buf.0 = Some(timestamp_ms);
+            buf.3 = false; // is_binary = false (text)
+        }
+
+        let base_ts = buf.0.unwrap();
+        let rel_ts = timestamp_ms.saturating_sub(base_ts).min(65535) as u16;
+
+        buf.1.push(BlockRecord {
+            rel_ts,
+            data: text.as_bytes().to_vec(),
+        });
+        buf.2 += BLOCK_RECORD_HEADER_SIZE + text.len();
+
+        // 检查是否需要刷新
+        if buf.2 >= self.block_size_threshold || buf.1.len() >= self.max_records {
+            self.flush_channel(channel)?;
+        }
+
+        Ok(0)
+    }
+
+    /// 刷新指定通道的缓冲区
+    fn flush_channel(&mut self, channel: u8) -> io::Result<()> {
+        let ch = (channel & 0x0F) as usize;
+        let buf = &mut self.channel_buffers[ch];
+
+        if buf.1.is_empty() {
+            return Ok(());
+        }
+
+        let base_ts = buf.0.unwrap();
+        let is_binary = buf.3;
+
+        // 构建块数据
+        // 格式: [base_ts:8B][子记录1][子记录2]...
+        let mut block_data = Vec::with_capacity(8 + buf.2);
+        block_data.extend_from_slice(&base_ts.to_le_bytes());
+
+        for record in buf.1.drain(..) {
+            block_data.extend_from_slice(&record.rel_ts.to_le_bytes());
+            block_data.extend_from_slice(&(record.data.len() as u16).to_le_bytes());
+            block_data.extend_from_slice(&record.data);
+        }
+
+        // 重置缓冲区状态
+        buf.0 = None;
+        buf.2 = 0;
+
+        // 压缩并写入
+        let compressed = compress_prepend_size(&block_data);
+        let use_compressed = compressed.len() < block_data.len();
+
+        let mut flag = (channel << CHANNEL_SHIFT) | FLAG_BLOCK;
+        if is_binary {
+            flag |= FLAG_BINARY;
+        }
+        if use_compressed {
+            flag |= FLAG_COMPRESSED;
+        }
+
+        let final_data = if use_compressed {
+            let mut marked = vec![flag];
+            marked.extend_from_slice(&compressed);
+            marked
+        } else {
+            let mut marked = vec![flag];
+            marked.extend_from_slice(&block_data);
+            marked
+        };
+
+        let seq = self.log.header.global_seq;
+        self.log.header.global_seq += 1;
+
+        let entry = StreamEntry {
+            sequence: seq,
+            timestamp_ms: base_ts,
+            data: final_data,
+        };
+
+        self.log.write_entry(&entry)?;
+        Ok(())
+    }
+
+    /// 刷新所有通道的缓冲区
+    pub fn flush(&mut self) -> io::Result<()> {
+        for ch in 0..16u8 {
+            self.flush_channel(ch)?;
+        }
+        self.log.flush()
+    }
+
+    /// 同步到磁盘
+    pub fn sync(&mut self) -> io::Result<()> {
+        self.flush()?;
+        self.log.sync()
+    }
+
+    pub fn stats(&self) -> StreamStats {
+        self.log.stats()
+    }
+
+    pub fn log_mut(&mut self) -> &mut StreamLog {
+        &mut self.log
+    }
+
+    /// 获取缓冲区状态（用于调试）
+    pub fn buffer_stats(&self) -> Vec<(u8, usize, usize)> {
+        let mut stats = Vec::new();
+        for (ch, buf) in self.channel_buffers.iter().enumerate() {
+            if !buf.1.is_empty() {
+                stats.push((ch as u8, buf.1.len(), buf.2));
+            }
+        }
+        stats
+    }
+}
+
+impl Drop for BlockWriter {
+    fn drop(&mut self) {
+        let _ = self.sync();
     }
 }
 
@@ -1470,6 +1742,120 @@ mod tests {
         }
 
         println!("=== 多通道测试通过 ===\n");
+        let _ = fs::remove_file(path);
+    }
+
+    /// 测试块压缩写入和读取
+    #[test]
+    fn test_block_writer() {
+        let path = "/tmp/test_block_writer.dat";
+        let _ = fs::remove_file(path);
+
+        println!("\n=== 块压缩测试 ===");
+
+        // 写入重复日志
+        let original_lines: Vec<String> = (0..100)
+            .map(|i| format!("[INFO] This is a repeated log message #{}", i))
+            .collect();
+
+        {
+            // 使用较小的阈值便于测试
+            let mut writer = BlockWriter::with_threshold(path, 64 * 1024, 1024, 50).unwrap();
+
+            for (i, line) in original_lines.iter().enumerate() {
+                let ts = 1000000 + i as u64 * 10; // 每 10ms 一条
+                writer.write_binary_ch(0, ts, line.as_bytes()).unwrap();
+            }
+
+            writer.sync().unwrap();
+
+            let stats = writer.stats();
+            println!("块写入统计: {:?}", stats);
+            println!("  写入位置: {} bytes", stats.write_pos);
+        }
+
+        // 读取并验证
+        {
+            let mut log = StreamLog::open(path, None).unwrap();
+            let entries = log.read_all().unwrap();
+
+            println!("读取到 {} 个条目", entries.len());
+
+            let mut recovered_lines: Vec<(u64, String)> = Vec::new();
+
+            for entry in &entries {
+                if entry.is_block() {
+                    println!(
+                        "  块条目: seq={}, ts={}, 压缩={}",
+                        entry.sequence,
+                        entry.timestamp_ms,
+                        entry.is_compressed()
+                    );
+
+                    if let Some(records) = entry.unpack_block() {
+                        println!("    解包出 {} 条子记录", records.len());
+                        for (ts, data) in records {
+                            let text = String::from_utf8_lossy(&data).to_string();
+                            recovered_lines.push((ts, text));
+                        }
+                    }
+                } else {
+                    println!(
+                        "  普通条目: seq={}, ts={}",
+                        entry.sequence, entry.timestamp_ms
+                    );
+                    if let Some(data) = entry.as_binary() {
+                        let text = String::from_utf8_lossy(&data).to_string();
+                        recovered_lines.push((entry.timestamp_ms, text));
+                    }
+                }
+            }
+
+            println!("恢复出 {} 行日志", recovered_lines.len());
+            assert_eq!(recovered_lines.len(), original_lines.len());
+
+            // 验证内容
+            for (i, (ts, text)) in recovered_lines.iter().enumerate() {
+                assert_eq!(text, &original_lines[i], "第 {} 行内容不匹配", i);
+                let expected_ts = 1000000 + i as u64 * 10;
+                assert_eq!(*ts, expected_ts, "第 {} 行时间戳不匹配", i);
+            }
+            println!("✓ 内容验证通过");
+        }
+
+        // 对比压缩效果
+        {
+            let path_no_block = "/tmp/test_no_block.dat";
+            let _ = fs::remove_file(path_no_block);
+
+            let mut writer = StreamWriter::new(path_no_block, 64 * 1024).unwrap();
+            for (i, line) in original_lines.iter().enumerate() {
+                let ts = 1000000 + i as u64 * 10;
+                writer.write_binary_ch(0, ts, line.as_bytes()).unwrap();
+            }
+            writer.sync().unwrap();
+
+            let stats_no_block = writer.stats();
+            let stats_block = StreamLog::open(path, None).unwrap().stats();
+
+            println!("\n压缩效果对比:");
+            println!("  无块压缩: {} bytes", stats_no_block.write_pos);
+            println!("  有块压缩: {} bytes", stats_block.write_pos);
+            println!(
+                "  压缩比: {:.1}%",
+                stats_block.write_pos as f64 / stats_no_block.write_pos as f64 * 100.0
+            );
+
+            // 块压缩应该更小
+            assert!(
+                stats_block.write_pos < stats_no_block.write_pos,
+                "块压缩应该比无压缩更小"
+            );
+
+            let _ = fs::remove_file(path_no_block);
+        }
+
+        println!("=== 块压缩测试通过 ===\n");
         let _ = fs::remove_file(path);
     }
 }

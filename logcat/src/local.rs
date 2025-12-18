@@ -1,7 +1,7 @@
 //! 本地模式: 本地执行 ar_logcat 命令
 
 use anyhow::Result;
-use rslog::StreamWriter;
+use rslog::BlockWriter;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,12 +20,15 @@ fn current_timestamp() -> u64 {
 
 /// 运行本地模式
 pub async fn run_local(output: &str, cmd: &str, max_size: u64) -> Result<()> {
-    let mut writer = StreamWriter::new(output, max_size)?;
+    // 使用 BlockWriter 进行块压缩写入
+    // 阈值: 4KB 或 500 条记录
+    let mut writer = BlockWriter::new(output, max_size)?;
 
     info!(
         "logcat: Recording from '{}' to {} (max {} bytes)",
         cmd, output, max_size
     );
+    info!("logcat: Block compression enabled (4KB/500 records threshold)");
     info!("logcat: Flush: every 1000 lines or 10s idle");
     info!("logcat: Press Ctrl+C to stop");
 

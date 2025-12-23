@@ -20,7 +20,8 @@ rslog = { path = "../rslog" }
 tokio = { version = "1", features = ["full", "process"] }
 
 # SSH 远程连接（仅 remote 模式需要）
-russh = { version = "0.55", optional = true }
+# 使用 ring 后端避免 Windows 上需要 NASM 的问题
+russh = { version = "0.55", optional = true, default-features = false, features = ["ring"] }
 
 # 命令行
 clap = { version = "4", features = ["derive"] }

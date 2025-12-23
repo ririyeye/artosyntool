@@ -102,23 +102,19 @@ pub fn run_export(opts: ExportOptions<'_>) -> Result<()> {
                 if entry.is_block() {
                     // 解包块内的子记录
                     if let Some(records) = entry.unpack_block() {
-                        for (ts, data) in records {
+                        for data in records {
                             let line = String::from_utf8_lossy(&data);
-                            writeln!(logcat_writer, "[{}] {}", ts, line.trim_end())?;
+                            // 不再输出时间戳，因为日志自带时间戳
+                            writeln!(logcat_writer, "{}", line.trim_end())?;
                             logcat_rows += 1;
                         }
                     }
                 } else if let Some(text) = entry.as_text() {
-                    writeln!(logcat_writer, "[{}] {}", entry.timestamp_ms, text)?;
+                    writeln!(logcat_writer, "{}", text)?;
                     logcat_rows += 1;
                 } else if let Some(data) = entry.as_binary() {
                     let line = String::from_utf8_lossy(&data);
-                    writeln!(
-                        logcat_writer,
-                        "[{}] {}",
-                        entry.timestamp_ms,
-                        line.trim_end()
-                    )?;
+                    writeln!(logcat_writer, "{}", line.trim_end())?;
                     logcat_rows += 1;
                 }
             }
@@ -130,7 +126,7 @@ pub fn run_export(opts: ExportOptions<'_>) -> Result<()> {
                     if let Some(records) = entry.unpack_block() {
                         ch1_block_count += 1;
                         ch1_subrecord_count += records.len() as u64;
-                        for (_ts, data) in records {
+                        for data in records {
                             // 处理每条子记录，检查是否需要创建新文件
                             let need_new_file = process_reg_data(
                                 &data,
@@ -291,12 +287,12 @@ pub fn run_export(opts: ExportOptions<'_>) -> Result<()> {
     let total_files = file_index + 1;
     if total_files > 1 {
         info!(
-            "logcat export: saved {} logcat lines to {}, {} reg rows to {} files (reg_trace.csv ~ reg_trace_{}.csv)",
+            "logcat export: saved {} logcat lines to {} , {} reg rows to {} files (reg_trace.csv ~ reg_trace_{}.csv)",
             logcat_rows, logcat_path, reg_rows, total_files, file_index
         );
     } else {
         info!(
-            "logcat export: saved {} logcat lines to {}, {} reg rows to {}",
+            "logcat export: saved {} logcat lines to {} , {} reg rows to {}",
             logcat_rows,
             logcat_path,
             reg_rows,
@@ -478,7 +474,8 @@ fn parse_config_chunk(data: &[u8]) -> Option<ChunkConfig> {
 /// 解析 ChunkN 数据块
 /// 格式: [MAGIC:4B][record_count:2B][records:...]
 /// 每条记录: ts_us(8) + seq_id(4) + irq_type(2) + data_len(2) + valid_mask(8) + raw_data[...]
-fn parse_data_chunk(data: &[u8], item_count: usize) -> Vec<(u64, u32, u32, Vec<u32>)> {
+/// 返回: Vec<(ts_us, seq_id, irq_type, values)>，values 中 None 表示该时间点该项无数据
+fn parse_data_chunk(data: &[u8], item_count: usize) -> Vec<(u64, u32, u32, Vec<Option<u32>>)> {
     // 最小长度: 4(magic) + 2(count) = 6
     if data.len() < 6 {
         return Vec::new();
@@ -546,23 +543,24 @@ fn parse_data_chunk(data: &[u8], item_count: usize) -> Vec<(u64, u32, u32, Vec<u
         offset += HEADER_SIZE;
 
         // 按 valid_mask 读取数据，每个有效项占 4 字节
-        let mut values = Vec::with_capacity(item_count);
+        // 使用 Option<u32> 区分有效值和无效值，无效值在 CSV 中输出为空
+        let mut values: Vec<Option<u32>> = Vec::with_capacity(item_count);
         let data_end = offset + data_len;
         for i in 0..item_count {
             if valid_mask & (1 << i) != 0 {
                 if offset + 4 <= data_end && offset + 4 <= records_data.len() {
-                    values.push(u32::from_le_bytes([
+                    values.push(Some(u32::from_le_bytes([
                         records_data[offset],
                         records_data[offset + 1],
                         records_data[offset + 2],
                         records_data[offset + 3],
-                    ]));
+                    ])));
                     offset += 4;
                 } else {
-                    values.push(0); // 数据不足，填充0
+                    values.push(None); // 数据不足，标记为无效
                 }
             } else {
-                values.push(0); // 该项无效，填充0
+                values.push(None); // 该项在此时间点无数据，标记为无效
             }
         }
         // 确保跳过整个数据区
@@ -575,7 +573,8 @@ fn parse_data_chunk(data: &[u8], item_count: usize) -> Vec<(u64, u32, u32, Vec<u
 }
 
 /// 格式化 CSV 行
-fn format_reg_row(ts_us: u64, seq_id: u32, irq_type: u32, values: &[u32]) -> String {
+/// values 中 None 表示该时间点该项无数据，在 CSV 中输出为空（PlotJuggler 会忽略空值）
+fn format_reg_row(ts_us: u64, seq_id: u32, irq_type: u32, values: &[Option<u32>]) -> String {
     let mut fields = Vec::with_capacity(3 + values.len());
 
     // 将微秒时间戳转换为秒（浮点数），PlotJuggler 更好识别
@@ -585,7 +584,10 @@ fn format_reg_row(ts_us: u64, seq_id: u32, irq_type: u32, values: &[u32]) -> Str
     fields.push(format!("0x{:04X}", irq_type));
 
     for v in values {
-        fields.push(v.to_string());
+        match v {
+            Some(val) => fields.push(val.to_string()),
+            None => fields.push(String::new()), // 空值，PlotJuggler 会忽略
+        }
     }
 
     fields.join(",")
@@ -687,10 +689,37 @@ mod tests {
         assert_eq!(records[0].0, ts1);
         assert_eq!(records[0].1, seq1);
         assert_eq!(records[0].2, irq1 as u32);
-        assert_eq!(records[0].3, values1.to_vec());
+        assert_eq!(records[0].3, vec![Some(0x1234), Some(0x5678)]);
         assert_eq!(records[1].0, ts2);
         assert_eq!(records[1].1, seq2);
         assert_eq!(records[1].2, irq2 as u32);
-        assert_eq!(records[1].3, values2.to_vec());
+        assert_eq!(records[1].3, vec![Some(0xAAAA), Some(0xBBBB)]);
+    }
+
+    #[test]
+    fn test_parse_data_chunk_partial_valid() {
+        // 测试部分有效的情况
+        let mut data = Vec::new();
+
+        data.extend_from_slice(&CHUNK_MAGIC_DATA);
+        data.extend_from_slice(&1u16.to_le_bytes()); // 1条记录
+
+        let ts: u64 = 1700000000000;
+        let seq: u32 = 0;
+        let irq: u16 = 0x0001;
+        let valid_mask: u64 = 0x01; // 只有第一项有效
+        let data_len: u16 = 4; // 只有1个值
+
+        data.extend_from_slice(&ts.to_le_bytes());
+        data.extend_from_slice(&seq.to_le_bytes());
+        data.extend_from_slice(&irq.to_le_bytes());
+        data.extend_from_slice(&data_len.to_le_bytes());
+        data.extend_from_slice(&valid_mask.to_le_bytes());
+        data.extend_from_slice(&0x1234u32.to_le_bytes());
+
+        let records = parse_data_chunk(&data, 2);
+        assert_eq!(records.len(), 1);
+        // 第一项有值，第二项为 None
+        assert_eq!(records[0].3, vec![Some(0x1234), None]);
     }
 }

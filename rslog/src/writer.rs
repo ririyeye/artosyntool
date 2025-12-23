@@ -6,11 +6,12 @@ use lz4_flex::compress_prepend_size;
 use std::io;
 use std::path::Path;
 
-use crate::constants::{
-    BLOCK_RECORD_HEADER_SIZE, CHANNEL_SHIFT, FLAG_BINARY, FLAG_BLOCK, FLAG_COMPRESSED,
-};
+use crate::constants::{CHANNEL_SHIFT, FLAG_BINARY, FLAG_BLOCK, FLAG_COMPRESSED};
 use crate::entry::StreamEntry;
 use crate::stream_log::{StreamLog, StreamStats};
+
+/// 块内子记录头大小: len(2B) - v2 格式移除了时间戳
+const BLOCK_SUBRECORD_HEADER_SIZE: usize = 2;
 
 /// 简化的写入器
 pub struct StreamWriter {
@@ -23,28 +24,23 @@ impl StreamWriter {
         Ok(Self { log })
     }
 
-    pub fn write_text(&mut self, timestamp_ms: u64, text: &str) -> io::Result<u64> {
-        self.log.write_text(timestamp_ms, text)
+    pub fn write_text(&mut self, text: &str) -> io::Result<u64> {
+        self.log.write_text(text)
     }
 
     /// 写入文本（指定通道）
-    pub fn write_text_ch(&mut self, channel: u8, timestamp_ms: u64, text: &str) -> io::Result<u64> {
-        self.log.write_text_ch(channel, timestamp_ms, text)
+    pub fn write_text_ch(&mut self, channel: u8, text: &str) -> io::Result<u64> {
+        self.log.write_text_ch(channel, text)
     }
 
     /// 写入二进制数据（默认通道0）
-    pub fn write_binary(&mut self, timestamp_ms: u64, data: &[u8]) -> io::Result<u64> {
-        self.log.write_binary(timestamp_ms, data)
+    pub fn write_binary(&mut self, data: &[u8]) -> io::Result<u64> {
+        self.log.write_binary(data)
     }
 
     /// 写入二进制数据（指定通道）
-    pub fn write_binary_ch(
-        &mut self,
-        channel: u8,
-        timestamp_ms: u64,
-        data: &[u8],
-    ) -> io::Result<u64> {
-        self.log.write_binary_ch(channel, timestamp_ms, data)
+    pub fn write_binary_ch(&mut self, channel: u8, data: &[u8]) -> io::Result<u64> {
+        self.log.write_binary_ch(channel, data)
     }
 
     pub fn flush(&mut self) -> io::Result<()> {
@@ -66,7 +62,6 @@ impl StreamWriter {
 
 /// 块内缓冲的子记录
 struct BlockRecord {
-    rel_ts: u16,   // 相对时间戳 (ms)
     data: Vec<u8>, // 原始数据
 }
 
@@ -122,12 +117,7 @@ impl BlockWriter {
     /// 写入二进制数据到缓冲区
     ///
     /// 注意：单条数据的长度不能超过 65535 字节（sub-record 的 len 字段是 u16）
-    pub fn write_binary_ch(
-        &mut self,
-        channel: u8,
-        timestamp_ms: u64,
-        data: &[u8],
-    ) -> io::Result<u64> {
+    pub fn write_binary_ch(&mut self, channel: u8, data: &[u8]) -> io::Result<u64> {
         // 检查单条数据大小是否超过 u16 限制
         if data.len() > 65535 {
             return Err(io::Error::new(
@@ -143,21 +133,16 @@ impl BlockWriter {
         let ch = (channel & 0x0F) as usize;
         let buf = &mut self.channel_buffers[ch];
 
-        // 如果缓冲区为空，记录基准时间戳
+        // 如果缓冲区为空，初始化
         if buf.0.is_none() {
-            buf.0 = Some(timestamp_ms);
+            buf.0 = Some(0); // 不再使用时间戳
             buf.3 = true; // is_binary
         }
 
-        let base_ts = buf.0.unwrap();
-        // 计算相对时间戳，限制在 u16 范围内（最大 65535ms ≈ 65秒）
-        let rel_ts = timestamp_ms.saturating_sub(base_ts).min(65535) as u16;
-
         buf.1.push(BlockRecord {
-            rel_ts,
             data: data.to_vec(),
         });
-        buf.2 += BLOCK_RECORD_HEADER_SIZE + data.len();
+        buf.2 += BLOCK_SUBRECORD_HEADER_SIZE + data.len();
 
         // 检查是否需要刷新
         if buf.2 >= self.block_size_threshold || buf.1.len() >= self.max_records {
@@ -168,24 +153,20 @@ impl BlockWriter {
     }
 
     /// 写入文本数据到缓冲区
-    pub fn write_text_ch(&mut self, channel: u8, timestamp_ms: u64, text: &str) -> io::Result<u64> {
+    pub fn write_text_ch(&mut self, channel: u8, text: &str) -> io::Result<u64> {
         let ch = (channel & 0x0F) as usize;
         let buf = &mut self.channel_buffers[ch];
 
-        // 如果缓冲区为空，记录基准时间戳
+        // 如果缓冲区为空，初始化
         if buf.0.is_none() {
-            buf.0 = Some(timestamp_ms);
+            buf.0 = Some(0); // 不再使用时间戳
             buf.3 = false; // is_binary = false (text)
         }
 
-        let base_ts = buf.0.unwrap();
-        let rel_ts = timestamp_ms.saturating_sub(base_ts).min(65535) as u16;
-
         buf.1.push(BlockRecord {
-            rel_ts,
             data: text.as_bytes().to_vec(),
         });
-        buf.2 += BLOCK_RECORD_HEADER_SIZE + text.len();
+        buf.2 += BLOCK_SUBRECORD_HEADER_SIZE + text.len();
 
         // 检查是否需要刷新
         if buf.2 >= self.block_size_threshold || buf.1.len() >= self.max_records {
@@ -204,16 +185,14 @@ impl BlockWriter {
             return Ok(());
         }
 
-        let base_ts = buf.0.unwrap();
         let is_binary = buf.3;
 
         // 构建块数据
-        // 格式: [base_ts:8B][子记录1][子记录2]...
-        let mut block_data = Vec::with_capacity(8 + buf.2);
-        block_data.extend_from_slice(&base_ts.to_le_bytes());
+        // 格式: [子记录1][子记录2]...
+        // 子记录: [len:2B][data:NB] (移除了 rel_ts)
+        let mut block_data = Vec::with_capacity(buf.2);
 
         for record in buf.1.drain(..) {
-            block_data.extend_from_slice(&record.rel_ts.to_le_bytes());
             block_data.extend_from_slice(&(record.data.len() as u16).to_le_bytes());
             block_data.extend_from_slice(&record.data);
         }
@@ -262,7 +241,6 @@ impl BlockWriter {
 
         let entry = StreamEntry {
             sequence: seq,
-            timestamp_ms: base_ts,
             data: final_data,
         };
 

@@ -5,16 +5,14 @@
 use crc32fast::Hasher;
 
 use crate::constants::{
-    BLOCK_RECORD_HEADER_SIZE, CHANNEL_MASK, CHANNEL_SHIFT, END_MAGIC, ENTRY_HEADER_SIZE,
-    ENTRY_OVERHEAD, FLAG_BINARY, FLAG_BLOCK, FLAG_COMPRESSED, SYNC_MAGIC,
+    CHANNEL_MASK, CHANNEL_SHIFT, END_MAGIC, ENTRY_HEADER_SIZE, ENTRY_OVERHEAD, FLAG_BINARY,
+    FLAG_BLOCK, FLAG_COMPRESSED, SYNC_MAGIC,
 };
 
 /// 单条日志条目
 #[derive(Debug, Clone)]
 pub struct StreamEntry {
     pub sequence: u64,
-    /// 毫秒时间戳 (6字节，范围约8925年)
-    pub timestamp_ms: u64,
     pub data: Vec<u8>,
 }
 
@@ -98,41 +96,35 @@ impl StreamEntry {
     }
 
     /// 解析块内的子记录
-    /// 块格式: [base_ts:8B][子记录1][子记录2]...
-    /// 子记录格式: [相对时间戳:2B][数据长度:2B][数据:NB]
-    /// 返回: Vec<(绝对时间戳, 数据)>
-    pub fn unpack_block(&self) -> Option<Vec<(u64, Vec<u8>)>> {
+    /// 块格式 (v2): [子记录1][子记录2]...
+    /// 子记录格式: [数据长度:2B][数据:NB]
+    /// 返回: Vec<数据>
+    pub fn unpack_block(&self) -> Option<Vec<Vec<u8>>> {
         if !self.is_block() {
             return None;
         }
 
         let raw = self.get_data();
-        if raw.len() < 8 {
+        if raw.is_empty() {
             return None;
         }
 
-        // 读取基准时间戳
-        let base_ts = u64::from_le_bytes([
-            raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
-        ]);
-
         let mut records = Vec::new();
-        let mut offset = 8;
+        let mut offset = 0;
+        // 新格式子记录头大小: len(2B)
+        const SUBRECORD_HEADER_SIZE: usize = 2;
 
-        while offset + BLOCK_RECORD_HEADER_SIZE <= raw.len() {
-            // 读取相对时间戳 (ms, 2B)
-            let rel_ts = u16::from_le_bytes([raw[offset], raw[offset + 1]]) as u64;
+        while offset + SUBRECORD_HEADER_SIZE <= raw.len() {
             // 读取数据长度 (2B)
-            let data_len = u16::from_le_bytes([raw[offset + 2], raw[offset + 3]]) as usize;
-            offset += BLOCK_RECORD_HEADER_SIZE;
+            let data_len = u16::from_le_bytes([raw[offset], raw[offset + 1]]) as usize;
+            offset += SUBRECORD_HEADER_SIZE;
 
             if offset + data_len > raw.len() {
                 break;
             }
 
             let data = raw[offset..offset + data_len].to_vec();
-            let abs_ts = base_ts + rel_ts;
-            records.push((abs_ts, data));
+            records.push(data);
             offset += data_len;
         }
 
@@ -154,9 +146,6 @@ impl StreamEntry {
         buf.extend_from_slice(&(self.data.len() as u16).to_le_bytes());
         // SeqNum
         buf.extend_from_slice(&self.sequence.to_le_bytes());
-        // Timestamp_ms (6 bytes, little-endian)
-        let ts_bytes = self.timestamp_ms.to_le_bytes();
-        buf.extend_from_slice(&ts_bytes[0..6]);
         // Data
         buf.extend_from_slice(&self.data);
 
@@ -220,16 +209,11 @@ impl StreamEntry {
         let sequence = u64::from_le_bytes([
             data[4], data[5], data[6], data[7], data[8], data[9], data[10], data[11],
         ]);
-        // Timestamp_ms (6 bytes, little-endian)
-        let timestamp_ms = u64::from_le_bytes([
-            data[12], data[13], data[14], data[15], data[16], data[17], 0, 0,
-        ]);
         let entry_data = data[ENTRY_HEADER_SIZE..ENTRY_HEADER_SIZE + len].to_vec();
 
         Some((
             StreamEntry {
                 sequence,
-                timestamp_ms,
                 data: entry_data,
             },
             total_size,

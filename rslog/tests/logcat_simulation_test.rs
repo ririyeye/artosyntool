@@ -89,8 +89,8 @@ impl LogcatSimulator {
 
     /// 刷新缓冲区到 rslog
     fn flush_buffer(&mut self) -> std::io::Result<()> {
-        for (ts, line) in self.buffer.drain(..) {
-            self.writer.write_text_ch(0, ts, &line)?;
+        for (_ts, line) in self.buffer.drain(..) {
+            self.writer.write_text_ch(0, &line)?;
         }
         self.writer.flush()?;
         self.last_flush_line_count = 0;
@@ -109,7 +109,7 @@ impl LogcatSimulator {
 }
 
 /// 从 rslog 还原日志内容
-fn restore_logs(log_path: &Path) -> std::io::Result<Vec<(u64, String)>> {
+fn restore_logs(log_path: &Path) -> std::io::Result<Vec<String>> {
     let mut log = StreamLog::open(log_path, None)?;
     let (entries, errors) = log.read_all_tolerant();
 
@@ -123,21 +123,18 @@ fn restore_logs(log_path: &Path) -> std::io::Result<Vec<(u64, String)>> {
         if entry.is_block() {
             // 解包块记录
             if let Some(records) = entry.unpack_block() {
-                for (ts, data) in records {
+                for data in records {
                     if let Ok(text) = String::from_utf8(data) {
-                        restored_lines.push((ts, text));
+                        restored_lines.push(text);
                     }
                 }
             }
         } else if entry.is_text() {
             if let Some(text) = entry.as_text() {
-                restored_lines.push((entry.timestamp_ms, text));
+                restored_lines.push(text);
             }
         }
     }
-
-    // 按时间戳排序
-    restored_lines.sort_by_key(|(ts, _)| *ts);
 
     Ok(restored_lines)
 }
@@ -205,8 +202,8 @@ fn test_logcat_simulation() {
         let mut simulator =
             LogcatSimulator::new(&rslog_path, max_rslog_size).expect("创建写入器失败");
 
-        for (ts, line) in &parsed_lines {
-            simulator.write_line(*ts, line).expect("写入失败");
+        for (_ts, line) in &parsed_lines {
+            simulator.write_line(0, line).expect("写入失败");
         }
 
         simulator.finish().expect("完成写入失败");
@@ -292,13 +289,13 @@ fn test_logcat_simulation() {
     let mut total_original_bytes = 0usize;
     let mut total_restored_bytes = 0usize;
 
-    for (i, ((_orig_ts, orig_line), (_rest_ts, rest_line))) in
+    for (i, ((_orig_ts, orig_line), rest_line)) in
         parsed_lines.iter().zip(restored_lines.iter()).enumerate()
     {
         total_original_bytes += orig_line.len();
         total_restored_bytes += rest_line.len();
 
-        if orig_line != rest_line {
+        if *orig_line != rest_line {
             mismatch_count += 1;
             if first_mismatch.is_none() {
                 first_mismatch = Some((i, orig_line.to_string(), rest_line.clone()));
@@ -334,7 +331,7 @@ fn test_logcat_simulation() {
     let restored_path = test_log_dir.join("restored_sky.txt");
     {
         let mut file = File::create(&restored_path).expect("创建还原文件失败");
-        for (_, line) in &restored_lines {
+        for line in &restored_lines {
             writeln!(file, "{}", line).expect("写入还原文件失败");
         }
     }
@@ -418,16 +415,16 @@ fn test_compression_comparison() {
             let mut writer =
                 BlockWriter::with_threshold(&rslog_path, max_size, block_size, max_records)
                     .expect("创建 BlockWriter 失败");
-            for (ts, line) in &parsed_lines {
-                writer.write_text_ch(0, *ts, line).expect("写入失败");
+            for (_ts, line) in &parsed_lines {
+                writer.write_text_ch(0, line).expect("写入失败");
             }
             writer.sync().expect("同步失败");
             writer.stats().used_size
         } else {
             let mut writer =
                 rslog::StreamWriter::new(&rslog_path, max_size).expect("创建 StreamWriter 失败");
-            for (ts, line) in &parsed_lines {
-                writer.write_text_ch(0, *ts, line).expect("写入失败");
+            for (_ts, line) in &parsed_lines {
+                writer.write_text_ch(0, line).expect("写入失败");
             }
             writer.sync().expect("同步失败");
             writer.stats().used_size

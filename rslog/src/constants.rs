@@ -8,12 +8,12 @@ pub const SYNC_MAGIC: u16 = 0xAA55;
 pub const END_MAGIC: u16 = 0x55AA;
 /// 文件头魔数
 pub const FILE_MAGIC: u32 = 0x534C4F47; // "SLOG"
-/// 版本号
-pub const VERSION: u32 = 1;
+/// 版本号 (v2: 移除了条目时间戳)
+pub const VERSION: u32 = 2;
 /// 文件头大小
 pub const HEADER_SIZE: u64 = 64;
-/// 条目头大小 (SYNC + Len + Seq + Timestamp_ms)
-pub const ENTRY_HEADER_SIZE: usize = 2 + 2 + 8 + 6;
+/// 条目头大小 (SYNC + Len + Seq)
+pub const ENTRY_HEADER_SIZE: usize = 2 + 2 + 8;
 /// 条目尾大小 (CRC + END)
 pub const ENTRY_FOOTER_SIZE: usize = 4 + 2;
 /// 条目开销

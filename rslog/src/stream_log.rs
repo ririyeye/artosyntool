@@ -174,8 +174,8 @@ impl StreamLog {
             }
 
             // 跳到 CRC 位置验证
-            // CRC 位置 = HEADER_SIZE + scan_pos + SYNC(2) + Len(2) + Seq(8) + TS(6) + Data(N)
-            //          = HEADER_SIZE + scan_pos + 18 + data_len
+            // CRC 位置 = HEADER_SIZE + scan_pos + SYNC(2) + Len(2) + Seq(8) + Data(N)
+            //          = HEADER_SIZE + scan_pos + 12 + data_len
             self.file.seek(SeekFrom::Start(
                 HEADER_SIZE + scan_pos + crate::constants::ENTRY_HEADER_SIZE as u64 + data_len,
             ))?;
@@ -186,10 +186,10 @@ impl StreamLog {
             let stored_crc = u32::from_le_bytes(crc_buf);
 
             // 读取完整数据计算 CRC
-            // CRC 覆盖从 Len 开始到 Data 结束: Len(2) + Seq(8) + TS(6) + Data(N)
+            // CRC 覆盖从 Len 开始到 Data 结束: Len(2) + Seq(8) + Data(N)
             self.file
                 .seek(SeekFrom::Start(HEADER_SIZE + scan_pos + 2))?; // 跳过 SYNC
-            let mut entry_data = vec![0u8; (2 + 8 + 6 + data_len) as usize];
+            let mut entry_data = vec![0u8; (2 + 8 + data_len) as usize];
             if self.file.read_exact(&mut entry_data).is_err() {
                 break;
             }
@@ -203,7 +203,7 @@ impl StreamLog {
                 break;
             }
 
-            // 读取序列号 (entry_data 格式: Len(2) + Seq(8) + TS(6) + Data(N))
+            // 读取序列号 (entry_data 格式: Len(2) + Seq(8) + Data(N))
             let seq = u64::from_le_bytes([
                 entry_data[2],
                 entry_data[3],
@@ -240,70 +240,52 @@ impl StreamLog {
     }
 
     /// 写入文本日志（默认通道0）
-    /// timestamp_ms: 毫秒时间戳（如 System::now() 的毫秒数）
-    pub fn write_text(&mut self, timestamp_ms: u64, text: &str) -> io::Result<u64> {
-        self.write_text_ch(0, timestamp_ms, text)
+    pub fn write_text(&mut self, text: &str) -> io::Result<u64> {
+        self.write_text_ch(0, text)
     }
 
     /// 写入文本日志（指定通道）
-    pub fn write_text_ch(&mut self, channel: u8, timestamp_ms: u64, text: &str) -> io::Result<u64> {
+    pub fn write_text_ch(&mut self, channel: u8, text: &str) -> io::Result<u64> {
         let flag = (channel << CHANNEL_SHIFT) & CHANNEL_MASK;
-        self.write_data_internal(timestamp_ms, text.as_bytes(), flag, false)
+        self.write_data_internal(text.as_bytes(), flag, false)
     }
 
     /// 写入压缩文本（适合大文本）
-    pub fn write_text_compressed(&mut self, timestamp_ms: u64, text: &str) -> io::Result<u64> {
-        self.write_text_compressed_ch(0, timestamp_ms, text)
+    pub fn write_text_compressed(&mut self, text: &str) -> io::Result<u64> {
+        self.write_text_compressed_ch(0, text)
     }
 
     /// 写入压缩文本（指定通道）
-    pub fn write_text_compressed_ch(
-        &mut self,
-        channel: u8,
-        timestamp_ms: u64,
-        text: &str,
-    ) -> io::Result<u64> {
+    pub fn write_text_compressed_ch(&mut self, channel: u8, text: &str) -> io::Result<u64> {
         let flag = (channel << CHANNEL_SHIFT) & CHANNEL_MASK;
-        self.write_data_internal(timestamp_ms, text.as_bytes(), flag, true)
+        self.write_data_internal(text.as_bytes(), flag, true)
     }
 
     /// 写入二进制数据（默认通道0）
-    pub fn write_binary(&mut self, timestamp_ms: u64, data: &[u8]) -> io::Result<u64> {
-        self.write_binary_ch(0, timestamp_ms, data)
+    pub fn write_binary(&mut self, data: &[u8]) -> io::Result<u64> {
+        self.write_binary_ch(0, data)
     }
 
     /// 写入二进制数据（指定通道）
-    pub fn write_binary_ch(
-        &mut self,
-        channel: u8,
-        timestamp_ms: u64,
-        data: &[u8],
-    ) -> io::Result<u64> {
+    pub fn write_binary_ch(&mut self, channel: u8, data: &[u8]) -> io::Result<u64> {
         let flag = ((channel << CHANNEL_SHIFT) & CHANNEL_MASK) | FLAG_BINARY;
-        self.write_data_internal(timestamp_ms, data, flag, false)
+        self.write_data_internal(data, flag, false)
     }
 
     /// 写入压缩二进制数据
-    pub fn write_binary_compressed(&mut self, timestamp_ms: u64, data: &[u8]) -> io::Result<u64> {
-        self.write_binary_compressed_ch(0, timestamp_ms, data)
+    pub fn write_binary_compressed(&mut self, data: &[u8]) -> io::Result<u64> {
+        self.write_binary_compressed_ch(0, data)
     }
 
     /// 写入压缩二进制数据（指定通道）
-    pub fn write_binary_compressed_ch(
-        &mut self,
-        channel: u8,
-        timestamp_ms: u64,
-        data: &[u8],
-    ) -> io::Result<u64> {
+    pub fn write_binary_compressed_ch(&mut self, channel: u8, data: &[u8]) -> io::Result<u64> {
         let flag = ((channel << CHANNEL_SHIFT) & CHANNEL_MASK) | FLAG_BINARY;
-        self.write_data_internal(timestamp_ms, data, flag, true)
+        self.write_data_internal(data, flag, true)
     }
 
     /// 内部写入方法
-    /// timestamp_ms: 毫秒时间戳
     fn write_data_internal(
         &mut self,
-        timestamp_ms: u64,
         data: &[u8],
         base_flag: u8,
         compress: bool,
@@ -332,7 +314,6 @@ impl StreamLog {
 
         let entry = StreamEntry {
             sequence: seq,
-            timestamp_ms,
             data: final_data,
         };
 

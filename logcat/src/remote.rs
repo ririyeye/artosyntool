@@ -47,14 +47,6 @@ pub struct RemoteOptions<'a> {
     pub reg_config: Option<RegTraceConfig>,
 }
 
-/// 获取当前时间戳（毫秒）
-fn current_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 /// SSH 客户端处理器
 struct SshHandler;
 
@@ -71,14 +63,10 @@ impl client::Handler for SshHandler {
 
 /// 将单条寄存器记录打包:
 /// 8字节时间戳(us) + 4字节seq_id + 2字节irq_type + 2字节data_len + 8字节valid_mask + raw_data
-fn record_to_bytes(ts_us: u64, record: &TraceRecord) -> Vec<u8> {
+fn record_to_bytes(record: &TraceRecord) -> Vec<u8> {
     let mut data = Vec::with_capacity(8 + 4 + 2 + 2 + 8 + record.raw_data.len());
-    // 时间戳 (us) - 使用记录的原始时间戳，如果为0则用采集时间
-    let ts = if record.timestamp_us > 0 {
-        record.timestamp_us
-    } else {
-        ts_us * 1000
-    };
+    // 时间戳 (us) - 使用记录的原始时间戳
+    let ts = record.timestamp_us;
     data.extend_from_slice(&ts.to_le_bytes());
     // seq_id
     data.extend_from_slice(&record.seq_id.to_le_bytes());
@@ -366,10 +354,9 @@ async fn run_reg_stream(
     if !*descriptor_written {
         // 写入二进制配置块
         let config_chunk = pack_config_chunk(config);
-        let ts = current_timestamp();
         {
             let mut w = writer.lock().await;
-            w.write_binary_ch(REG_CHANNEL, ts, &config_chunk)?;
+            w.write_binary_ch(REG_CHANNEL, &config_chunk)?;
         }
 
         // 同时写入 JSON descriptor (便于人工查看)
@@ -377,7 +364,7 @@ async fn run_reg_stream(
         let json = serde_json::to_string(&descriptor)?;
         {
             let mut w = writer.lock().await;
-            w.write_text_ch(REG_CHANNEL, ts, &json)?;
+            w.write_text_ch(REG_CHANNEL, &json)?;
         }
         *descriptor_written = true;
         info!("reg: Config chunk (Chunk0) and descriptor written");
@@ -402,7 +389,7 @@ async fn run_reg_stream(
                 info!("reg: Writing final batch: {} records", batch_count);
                 let data_chunk = pack_data_chunk(&batch, batch_count as u16);
                 let mut w = writer.lock().await;
-                if let Err(e) = w.write_binary_ch(REG_CHANNEL, current_timestamp(), &data_chunk) {
+                if let Err(e) = w.write_binary_ch(REG_CHANNEL, &data_chunk) {
                     error!("reg: Final batch write error: {}", e);
                 }
                 // 确保数据被刷新到文件
@@ -424,11 +411,10 @@ async fn run_reg_stream(
 
         // 检查是否需要定时刷新批量数据 (打包为 ChunkN)
         if !batch.is_empty() && last_flush.elapsed() >= flush_interval {
-            let ts = current_timestamp();
             let data_chunk = pack_data_chunk(&batch, batch_count as u16);
             {
                 let mut w = writer.lock().await;
-                if let Err(e) = w.write_binary_ch(REG_CHANNEL, ts, &data_chunk) {
+                if let Err(e) = w.write_binary_ch(REG_CHANNEL, &data_chunk) {
                     error!("reg: Batch write error: {}", e);
                 }
                 // 刷新 BlockWriter 确保数据写入文件（只刷新寄存器通道）
@@ -459,7 +445,7 @@ async fn run_reg_stream(
                         if !batch.is_empty() {
                             let data_chunk = pack_data_chunk(&batch, batch_count as u16);
                             let mut w = writer.lock().await;
-                            let _ = w.write_binary_ch(REG_CHANNEL, current_timestamp(), &data_chunk);
+                            let _ = w.write_binary_ch(REG_CHANNEL, &data_chunk);
                             let _ = w.flush();
                         }
                         return Err(anyhow!("Connection closed by server"));
@@ -473,9 +459,8 @@ async fn run_reg_stream(
                                 // 解析推送数据
                                 if let Some(data_resp) = DataPushResponse::from_payload(&msg.payload) {
                                     if data_resp.result == ar_dbg_client::ErrorCode::Ok {
-                                        let ts = current_timestamp();
                                         for record in &data_resp.records {
-                                            let record_bytes = record_to_bytes(ts, record);
+                                            let record_bytes = record_to_bytes(record);
                                             batch.extend_from_slice(&record_bytes);
                                             batch_count += 1;
 
@@ -487,11 +472,10 @@ async fn run_reg_stream(
 
                                         // 检查批量大小是否超过限制，如果超过则提前刷新
                                         if batch.len() >= MAX_BATCH_BYTES {
-                                            let ts = current_timestamp();
                                             let data_chunk = pack_data_chunk(&batch, batch_count as u16);
                                             {
                                                 let mut w = writer.lock().await;
-                                                if let Err(e) = w.write_binary_ch(REG_CHANNEL, ts, &data_chunk) {
+                                                if let Err(e) = w.write_binary_ch(REG_CHANNEL, &data_chunk) {
                                                     error!("reg: Batch write error (size limit): {}", e);
                                                 }
                                                 // 只刷新寄存器通道
@@ -520,7 +504,7 @@ async fn run_reg_stream(
                         if !batch.is_empty() {
                             let data_chunk = pack_data_chunk(&batch, batch_count as u16);
                             let mut w = writer.lock().await;
-                            let _ = w.write_binary_ch(REG_CHANNEL, current_timestamp(), &data_chunk);
+                            let _ = w.write_binary_ch(REG_CHANNEL, &data_chunk);
                             let _ = w.flush();
                         }
                         return Err(anyhow!("Read error: {}", e));
@@ -664,7 +648,7 @@ async fn run_ssh_logcat(
                                     // 存储到第一个二进制通道 (通道 0)
                                     {
                                         let mut w = writer.lock().await;
-                                        if let Err(e) = w.write_binary_ch(0, current_timestamp(), &line_buffer) {
+                                        if let Err(e) = w.write_binary_ch(0, &line_buffer) {
                                             error!("logcat: Write error: {}", e);
                                         }
                                     }
@@ -739,7 +723,7 @@ async fn run_ssh_logcat(
     // 处理剩余的数据
     if !line_buffer.is_empty() {
         let mut w = writer.lock().await;
-        if let Err(e) = w.write_binary_ch(0, current_timestamp(), &line_buffer) {
+        if let Err(e) = w.write_binary_ch(0, &line_buffer) {
             error!("logcat: Final write error: {}", e);
         }
         line_count += 1;

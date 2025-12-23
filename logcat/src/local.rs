@@ -10,14 +10,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
-/// 获取当前时间戳（毫秒）
-fn current_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 /// 运行本地模式
 pub async fn run_local(output: &str, cmd: &str, max_size: u64) -> Result<()> {
     // 使用 BlockWriter 进行块压缩写入
@@ -85,7 +77,7 @@ pub async fn run_local(output: &str, cmd: &str, max_size: u64) -> Result<()> {
 
                 if !line.is_empty() {
                     // 存储到第一个二进制通道 (通道 0)
-                    writer.write_binary_ch(0, current_timestamp(), line.as_bytes())?;
+                    writer.write_binary_ch(0, line.as_bytes())?;
                 }
 
                 line_count += 1;

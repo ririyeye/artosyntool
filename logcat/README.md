@@ -200,16 +200,18 @@ items[2]: page=2, offset=16, width=4, irq_mask=0xFFFF (ALL)
 └─────────────────────────────────────────────────────────────────┘
 
 单条记录格式:
-┌──────────────┬──────────┬──────────┬──────────┬────────────────┐
-│ timestamp_ms │  seq_id  │ irq_type │  word0   │ word1 ...      │
-│   8 bytes    │ 4 bytes  │ 4 bytes  │ 4 bytes  │ 4*N bytes      │
-└──────────────┴──────────┴──────────┴──────────┴────────────────┘
-     LE(u64)     LE(u32)    LE(u32)     LE(u32)
+┌──────────────┬──────────┬──────────┬──────────┬──────────────┬────────────────┐
+│ timestamp_us │  seq_id  │ irq_type │ data_len │  valid_mask  │ raw_data       │
+│   8 bytes    │ 4 bytes  │ 2 bytes  │ 2 bytes  │   8 bytes    │ N bytes        │
+└──────────────┴──────────┴──────────┴──────────┴──────────────┴────────────────┘
+     LE(u64)     LE(u32)    LE(u16)    LE(u16)      LE(u64)
 
-- timestamp_ms: 64位毫秒时间戳 (Unix epoch)
+- timestamp_us: 64位微秒时间戳 (设备端高精度时间戳)
 - seq_id: 记录序列号
 - irq_type: 触发该记录的中断类型
-- wordN: 第N个寄存器的值 (固定 4 字节)
+- data_len: raw_data 长度
+- valid_mask: 有效数据位掩码
+- raw_data: 原始寄存器数据
 ```
 
 #### 存储与压缩流程

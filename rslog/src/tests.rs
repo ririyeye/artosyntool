@@ -15,8 +15,7 @@ fn test_stream_basic() {
         let mut log = StreamLog::open(path, Some(64 * 1024)).unwrap();
 
         for i in 0..100 {
-            log.write_text(i * 100, &format!("Log message {}", i))
-                .unwrap();
+            log.write_text(&format!("Log message {}", i)).unwrap();
         }
 
         log.sync().unwrap();
@@ -52,7 +51,7 @@ fn test_mixed_text_binary() {
         for i in 0..10 {
             // 文本日志 (ar_logcat)
             let text = format!("[{}][INFO] Device status check #{}", i * 1000, i);
-            log.write_text(i * 1000, &text).unwrap();
+            log.write_text(&text).unwrap();
 
             // 二进制数据 (ar_logbin)
             let binary_data: Vec<u8> = vec![
@@ -65,7 +64,7 @@ fn test_mixed_text_binary() {
                 0xCD,
                 0xEF, // data
             ];
-            log.write_binary(i * 1000 + 500, &binary_data).unwrap();
+            log.write_binary(&binary_data).unwrap();
         }
 
         log.sync().unwrap();
@@ -89,14 +88,14 @@ fn test_mixed_text_binary() {
                 let text = entry.as_text().unwrap();
                 println!(
                     "  [TEXT  seq={:>2} ts={:>8}] {}",
-                    entry.sequence, entry.timestamp_ms, text
+                    entry.sequence, entry.sequence, text
                 );
             } else if entry.is_binary() {
                 binary_count += 1;
                 let data = entry.as_binary().unwrap();
                 println!(
                     "  [BINARY seq={:>2} ts={:>8}] {:02X?}",
-                    entry.sequence, entry.timestamp_ms, data
+                    entry.sequence, entry.sequence, data
                 );
             }
         }
@@ -132,7 +131,7 @@ fn test_stream_small_frequent() {
         // 模拟每 30 分钟写一条 100 字节
         for i in 0..50 {
             let msg = format!("Status OK at interval {}", i);
-            log.write_text(i * 1800, &msg).unwrap();
+            log.write_text(&msg).unwrap();
             log.sync().unwrap(); // 每条都刷新
         }
 
@@ -148,7 +147,7 @@ fn test_stream_small_frequent() {
         // 验证数据连续性
         for entry in &entries {
             let text = String::from_utf8_lossy(&entry.data[1..]); // 跳过压缩标记
-            println!("  [{}] {}", entry.timestamp_ms, text);
+            println!("  [{}] {}", entry.sequence, text);
         }
     }
 
@@ -165,8 +164,7 @@ fn test_stream_wraparound() {
 
         // 写入超过 1KB 的数据，触发回绕
         for i in 0..100 {
-            log.write_text(i * 100, &format!("Message number {}", i))
-                .unwrap();
+            log.write_text(&format!("Message number {}", i)).unwrap();
         }
 
         log.sync().unwrap();
@@ -207,7 +205,7 @@ fn test_stream_large_overwrite() {
         println!("\n=== 写入 10 个 ~8KB 的条目 ===");
         for i in 0..10 {
             let data = format!("Block {} data: {}", i, "X".repeat(block_data_size - 20));
-            log.write_text(i as u64 * 1000, &data).unwrap();
+            log.write_text(&data).unwrap();
             println!("写入 Entry seq={}, 数据大小={} 字节", i, data.len());
         }
         log.sync().unwrap();
@@ -228,7 +226,7 @@ fn test_stream_large_overwrite() {
         println!("\n=== 写入 1 个 ~20KB 的大条目 ===");
         let large_data_size = 20 * 1024 - 24;
         let large_data = format!("LARGE Block: {}", "Y".repeat(large_data_size - 15));
-        log.write_text(99999u64, &large_data).unwrap();
+        log.write_text(&large_data).unwrap();
         println!("写入 Entry seq=10, 数据大小={} 字节", large_data.len());
         log.sync().unwrap();
 
@@ -264,7 +262,7 @@ fn test_stream_large_overwrite() {
                 "  [{}] seq={:>2}, timestamp={:>8}, size={:>5} bytes, preview: {}...",
                 i,
                 entry.sequence,
-                entry.timestamp_ms,
+                entry.sequence,
                 entry.data.len(),
                 preview
             );
@@ -278,7 +276,7 @@ fn test_stream_large_overwrite() {
         for entry in &sorted {
             println!(
                 "  seq={:>2}, timestamp={:>8}",
-                entry.sequence, entry.timestamp_ms
+                entry.sequence, entry.sequence
             );
         }
 
@@ -340,7 +338,7 @@ fn test_power_loss_recovery() {
         let mut log = StreamLog::open(path, Some(64 * 1024)).unwrap();
 
         for i in 0..5 {
-            log.write_text(i * 100, &format!("Message {}", i)).unwrap();
+            log.write_text(&format!("Message {}", i)).unwrap();
         }
         log.sync().unwrap();
 
@@ -353,7 +351,7 @@ fn test_power_loss_recovery() {
         let mut log = StreamLog::open(path, None).unwrap();
 
         for i in 5..8 {
-            log.write_text(i * 100, &format!("Message {}", i)).unwrap();
+            log.write_text(&format!("Message {}", i)).unwrap();
         }
         // 数据已经写入文件，但故意不 sync header
         // 模拟断电：手动把 header 的 write_pos 恢复到旧值
@@ -397,13 +395,13 @@ fn test_power_loss_recovery() {
         println!("可读取条目: {} 条", entries.len());
 
         for entry in &entries {
-            println!("  seq={}, ts={}", entry.sequence, entry.timestamp_ms);
+            println!("  seq={}, ts={}", entry.sequence, entry.sequence);
         }
 
         assert_eq!(entries.len(), 8, "应该恢复全部 8 条日志");
 
         // 继续写入第 9 条，验证追加正确
-        log.write_text(8000, "Message 8 after recovery").unwrap();
+        log.write_text("Message 8 after recovery").unwrap();
         log.sync().unwrap();
 
         let entries_after = log.read_all().unwrap();
@@ -435,7 +433,7 @@ fn test_power_loss_after_wraparound() {
 
         // 每条约 50 字节，写入约 30 条会触发回绕
         for i in 0..30 {
-            log.write_text(i * 100, &format!("Msg{:02}", i)).unwrap();
+            log.write_text(&format!("Msg{:02}", i)).unwrap();
         }
         log.sync().unwrap();
 
@@ -455,7 +453,7 @@ fn test_power_loss_after_wraparound() {
 
         // 再写 5 条
         for i in 30..35 {
-            log.write_text(i * 100, &format!("Msg{:02}", i)).unwrap();
+            log.write_text(&format!("Msg{:02}", i)).unwrap();
         }
 
         let write_pos_after_35 = log.stats().write_pos;
@@ -503,7 +501,7 @@ fn test_power_loss_after_wraparound() {
         assert!(max_seq >= 34, "应该恢复到 seq=34，实际 max_seq={}", max_seq);
 
         // 继续写入验证追加正确
-        log.write_text(99999, "After wrap recovery").unwrap();
+        log.write_text("After wrap recovery").unwrap();
         log.sync().unwrap();
 
         let seq_after = log.stats().global_seq;
@@ -533,23 +531,23 @@ fn test_multi_channel() {
         // 通道 3: 网络包 (二进制)
 
         for i in 0..5 {
-            let ts = i as u64 * 1000;
+            let _ts = i as u64 * 1000;
 
             // 通道 0: 主日志
-            log.write_text_ch(0, ts, &format!("[主日志] 事件 {}", i))
+            log.write_text_ch(0, &format!("[主日志] 事件 {}", i))
                 .unwrap();
 
             // 通道 1: 调试日志
-            log.write_text_ch(1, ts + 100, &format!("[调试] 详细信息 {}", i))
+            log.write_text_ch(1, &format!("[调试] 详细信息 {}", i))
                 .unwrap();
 
             // 通道 2: 传感器二进制数据
             let sensor_data = vec![0x01, 0x02, i as u8, 0x04];
-            log.write_binary_ch(2, ts + 200, &sensor_data).unwrap();
+            log.write_binary_ch(2, &sensor_data).unwrap();
 
             // 通道 3: 网络包
             let packet = vec![0xAA, 0xBB, 0xCC, i as u8, 0xDD, 0xEE];
-            log.write_binary_ch(3, ts + 300, &packet).unwrap();
+            log.write_binary_ch(3, &packet).unwrap();
         }
 
         log.sync().unwrap();
@@ -580,7 +578,7 @@ fn test_multi_channel() {
                 let text = entry.as_text().unwrap();
                 println!(
                     "  [CH{} TEXT  seq={:>2} ts={:>8}] {}",
-                    ch, entry.sequence, entry.timestamp_ms, text
+                    ch, entry.sequence, entry.sequence, text
                 );
             } else if entry.is_binary() {
                 if !binary_channels.contains(&ch) {
@@ -589,7 +587,7 @@ fn test_multi_channel() {
                 let data = entry.as_binary().unwrap();
                 println!(
                     "  [CH{} BIN   seq={:>2} ts={:>8}] {:02X?}",
-                    ch, entry.sequence, entry.timestamp_ms, data
+                    ch, entry.sequence, entry.sequence, data
                 );
             }
         }
@@ -651,8 +649,8 @@ fn test_block_writer() {
         let mut writer = BlockWriter::with_threshold(path, 64 * 1024, 1024, 50).unwrap();
 
         for (i, line) in original_lines.iter().enumerate() {
-            let ts = 1000000 + i as u64 * 10; // 每 10ms 一条
-            writer.write_binary_ch(0, ts, line.as_bytes()).unwrap();
+            let _ts = 1000000 + i as u64 * 10; // 每 10ms 一条
+            writer.write_binary_ch(0, line.as_bytes()).unwrap();
         }
 
         writer.sync().unwrap();
@@ -669,32 +667,29 @@ fn test_block_writer() {
 
         println!("读取到 {} 个条目", entries.len());
 
-        let mut recovered_lines: Vec<(u64, String)> = Vec::new();
+        let mut recovered_lines: Vec<String> = Vec::new();
 
         for entry in &entries {
             if entry.is_block() {
                 println!(
                     "  块条目: seq={}, ts={}, 压缩={}",
                     entry.sequence,
-                    entry.timestamp_ms,
+                    entry.sequence,
                     entry.is_compressed()
                 );
 
                 if let Some(records) = entry.unpack_block() {
                     println!("    解包出 {} 条子记录", records.len());
-                    for (ts, data) in records {
+                    for data in records {
                         let text = String::from_utf8_lossy(&data).to_string();
-                        recovered_lines.push((ts, text));
+                        recovered_lines.push(text);
                     }
                 }
             } else {
-                println!(
-                    "  普通条目: seq={}, ts={}",
-                    entry.sequence, entry.timestamp_ms
-                );
+                println!("  普通条目: seq={}", entry.sequence);
                 if let Some(data) = entry.as_binary() {
                     let text = String::from_utf8_lossy(&data).to_string();
-                    recovered_lines.push((entry.timestamp_ms, text));
+                    recovered_lines.push(text);
                 }
             }
         }
@@ -703,10 +698,8 @@ fn test_block_writer() {
         assert_eq!(recovered_lines.len(), original_lines.len());
 
         // 验证内容
-        for (i, (ts, text)) in recovered_lines.iter().enumerate() {
+        for (i, text) in recovered_lines.iter().enumerate() {
             assert_eq!(text, &original_lines[i], "第 {} 行内容不匹配", i);
-            let expected_ts = 1000000 + i as u64 * 10;
-            assert_eq!(*ts, expected_ts, "第 {} 行时间戳不匹配", i);
         }
         println!("✓ 内容验证通过");
     }
@@ -717,9 +710,8 @@ fn test_block_writer() {
         let _ = fs::remove_file(path_no_block);
 
         let mut writer = StreamWriter::new(path_no_block, 64 * 1024).unwrap();
-        for (i, line) in original_lines.iter().enumerate() {
-            let ts = 1000000 + i as u64 * 10;
-            writer.write_binary_ch(0, ts, line.as_bytes()).unwrap();
+        for (_i, line) in original_lines.iter().enumerate() {
+            writer.write_binary_ch(0, line.as_bytes()).unwrap();
         }
         writer.sync().unwrap();
 

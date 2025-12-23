@@ -47,9 +47,65 @@ logcat export -i rslog_remote.dat -D ./logcat_export
 
 # 导出结果
 # - ar_logcat.txt : ar_logcat 文本（带时间戳）
-# - reg_trace.csv : 寄存器数据 CSV（首列时间戳，第二列 seq_id，后续为寄存器值）
+# - reg_trace.csv : 寄存器数据 CSV（首列时间戳，第二列 seq_id，后续为寄存器值，表头为 reg_p{page}_0x{offset}）
 # - reg_descriptor.json : 寄存器字段说明（字段名、页、偏移、宽度等）
 ```
+
+## 数据后处理
+
+为了支持更灵活的数据分析，工具链提供了后处理脚本 `post_process.py`，用于将原始的寄存器地址数据转换为具有业务含义的字段。
+
+### 1. 配置扩展
+
+在寄存器配置文件中，可以为每个寄存器项添加 `post_process` 字段，支持 `split`（位域拆分）和 `transform`（数学变换）。
+
+```json
+{
+  "items": [
+    {
+      "page": 1,
+      "offset": "0x84",
+      "width": 4,
+      "name": "FS_PA_STATE",
+      "description": "扫频PA状态",
+      "post_process": {
+        "split": [
+          {"name": "FS_2G_PA_ON", "bit_range": [25, 24]},
+          {"name": "FS_RX_AGAIN", "bit_range": [7, 0]}
+        ]
+      }
+    },
+    {
+      "page": 5,
+      "offset": "0x28",
+      "width": 4,
+      "name": "POWER_TD",
+      "description": "时域功率",
+      "post_process": {
+        "transform": "10 * math.log10(x / 64) if x > 0 else 0"
+      }
+    }
+  ]
+}
+```
+
+- **split**: 将一个寄存器值按位拆分为多个字段。`bit_range` 为 `[MSB, LSB]`。
+- **transform**: 使用 Python 表达式转换数值。变量 `x` 代表原始寄存器值，支持 `math` 库函数。
+
+### 2. 运行后处理
+
+使用 `post_process.py` 脚本处理导出后的 CSV 文件：
+
+```bash
+# 用法: python3 post_process.py <配置文件> <输入CSV> [输出CSV]
+python3 post_process.py reg_config.json ./logcat_export/reg_trace.csv final_result.csv
+```
+
+生成的 `final_result.csv` 将包含：
+- 原始的通用字段（timestamp, seq_id 等）
+- 根据 `split` 拆分出的新字段
+- 根据 `transform` 转换后的新字段（或覆盖原字段）
+- 未配置后处理的字段将使用配置文件中的 `name` 作为列名
 
 ## 寄存器配置文件格式
 

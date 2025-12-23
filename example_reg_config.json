@@ -1,207 +1,228 @@
 {
-  "name": "example_regs",
-  "description": "示例寄存器配置",
-  "host": "192.168.10.100",
-  "port": 12345,
-  "sample_div": 1,
-  "buffer_depth": 100,
-  "_irq_mask_bits": {
-    "RX_BR_END": "0x0001",
-    "TX_BR_END": "0x0002",
-    "CSMA_START_ENC": "0x0004",
-    "FSM_STATE_CHG": "0x0008",
-    "FSM_TRX": "0x0010",
-    "SLOT_SOP": "0x0020",
-    "TX_PRE_ENC": "0x0040",
-    "RX_RDOUT": "0x0080",
-    "FCH_DEC": "0x0100",
-    "FREQ_SWEEP": "0x0200",
-    "ALL": "0xFFFF"
-  },
-  "items": [
-    {
-      "page": 4,
-      "offset": "0x5C",
-      "width": 4,
-      "irq_mask": "0x0003",
-      "name": "FSM_CUR_STATE",
-      "description": "FSM当前状态 bit[28:24] (BB_REG_PAGE4_5C)"
+    "name": "example_regs",
+    "description": "示例寄存器配置",
+    "host": "192.168.10.100",
+    "port": 12345,
+    "sample_div": 1,
+    "buffer_depth": 100,
+    "_irq_mask_bits": {
+        "RX_BR_END": "0x0001",
+        "TX_BR_END": "0x0002",
+        "CSMA_START_ENC": "0x0004",
+        "FSM_STATE_CHG": "0x0008",
+        "FSM_TRX": "0x0010",
+        "SLOT_SOP": "0x0020",
+        "TX_PRE_ENC": "0x0040",
+        "RX_RDOUT": "0x0080",
+        "FCH_DEC": "0x0100",
+        "FREQ_SWEEP": "0x0200",
+        "ALL": "0xFFFF"
     },
-    {
-      "page": 4,
-      "offset": "0xDC",
-      "width": 4,
-      "irq_mask": "0x0003",
-      "name": "LOCK_STATUS",
-      "description": "锁定状态: BR_LOCK[16], FCH_LOCK[31:28], SLOT_LOCK[27:24], BR_LDPC_ERR[7:0]"
-    },
-    {
-      "page": 0,
-      "offset": "0xD0",
-      "width": 4,
-      "irq_mask": "0x0003",
-      "name": "RF_BR_FREQ",
-      "description": "BR 频点 (BB_REG_PAGE0_D0)"
-    },
-    {
-      "page": 0,
-      "offset": "0xD8",
-      "width": 4,
-      "irq_mask": "0x0002",
-      "name": "RF_DW_FREQ_0",
-      "description": "下行TX频点0 (Slot TX) (BB_REG_PAGE0_D8)"
-    },
-    {
-      "page": 0,
-      "offset": "0xE8",
-      "width": 4,
-      "irq_mask": "0x0001",
-      "name": "RF_UP_FREQ_0",
-      "description": "上行RX频点0 (Slot RX) (BB_REG_PAGE0_E8)"
-    },
-    {
-      "page": 0,
-      "offset": "0xF8",
-      "width": 4,
-      "irq_mask": "0x0004",
-      "name": "RF_CSMA_FREQ",
-      "description": "CSMA 频点 (BB_REQ_PAGE0_F8)"
-    },
-    {
-      "page": 1,
-      "offset": "0x54",
-      "width": 4,
-      "irq_mask": "0xFFFF",
-      "name": "USR0_PA_POWER",
-      "description": "用户0 PA状态: PA_ON_2G[25:24], PA_ON_5G[27:26], TX_REF_GAIN[13:8]"
-    },
-    {
-      "page": 1,
-      "offset": "0x84",
-      "width": 4,
-      "irq_mask": "0x0200",
-      "name": "FS_PA_STATE",
-      "description": "扫频PA状态: FS_2G_PA_ON[25:24], FS_RX_AGAIN[7:0]"
-    },
-    {
-      "page": 5,
-      "offset": "0x28",
-      "width": 4,
-      "irq_mask": "0x0200",
-      "name": "POWER_TD",
-      "description": "时域功率 / 扫频功率 (BB_REG_PAGE5_28)"
-    },
-    {
-      "page": 4,
-      "offset": "0xA0",
-      "width": 4,
-      "irq_mask": "0x0001",
-      "name": "BR_SNR",
-      "description": "BR SNR值 bit[15:0] (BB_REG_PAGE4_A0)"
-    },
-    {
-      "page": 4,
-      "offset": "0x60",
-      "width": 4,
-      "irq_mask": "0x0080",
-      "name": "SNR_DOUT",
-      "description": "SNR输出: QAM_SNR[15:0], PREAM_SNR[31:16] (BB_REG_PAGE4_60)"
-    },
-    {
-      "page": 4,
-      "offset": "0x70",
-      "width": 4,
-      "irq_mask": "0x0080",
-      "name": "USR0_SNR",
-      "description": "用户0 Slot SNR bit[15:0] (BB_REG_PAGE4_70)"
-    },
-    {
-      "page": 4,
-      "offset": "0x50",
-      "width": 8,
-      "irq_mask": "0x0001",
-      "name": "BR_GAIN",
-      "description": "BR AGC增益: GAIN0[15:0], GAIN1[31:16], GAIN2[47:32], GAIN3[63:48]"
-    },
-    {
-      "page": 4,
-      "offset": "0x08",
-      "width": 4,
-      "irq_mask": "0x0080",
-      "name": "USER0_GAIN_0",
-      "description": "用户0 AGC增益0 bit[31:16] (BB_REG_PAGE4_08)"
-    },
-    {
-      "page": 4,
-      "offset": "0x0C",
-      "width": 4,
-      "irq_mask": "0x0080",
-      "name": "USER0_GAIN_1_2",
-      "description": "用户0 AGC增益1[15:0], 增益2[31:16] (BB_REG_PAGE4_0C)"
-    },
-    {
-      "page": 4,
-      "offset": "0x10",
-      "width": 4,
-      "irq_mask": "0x0080",
-      "name": "USER0_GAIN_3",
-      "description": "用户0 AGC增益3 bit[15:0] (BB_REG_PAGE4_10)"
-    },
-    {
-      "page": 4,
-      "offset": "0x40",
-      "width": 8,
-      "irq_mask": "0x0004",
-      "name": "CSMA_GAIN",
-      "description": "CSMA AGC增益 (BB_REG_PAGE4_40~44)"
-    },
-    {
-      "page": 1,
-      "offset": "0x28",
-      "width": 8,
-      "irq_mask": "0xFFFF",
-      "name": "AAGC_RSSI_GAIN",
-      "description": "AAGC RSSI增益1-6: G1[23:16], G2[31:24], G3[39:32], G4[47:40], G5[55:48], G6[63:56]"
-    },
-    {
-      "page": 5,
-      "offset": "0x30",
-      "width": 4,
-      "irq_mask": "0xFFFF",
-      "name": "RX_GAIN_TOTAL",
-      "description": "RX总增益: RX1[23:16], RX2[31:24] (BB_REG_PAGE5_30)"
-    },
-    {
-      "page": 4,
-      "offset": "0xB0",
-      "width": 4,
-      "irq_mask": "0x0100",
-      "name": "FCH_RECV_INFO",
-      "description": "FCH接收信息: QAM_MODE[2:0], LDPC_MODE[6:3], FCH_CHECK_OK[7]"
-    },
-    {
-      "page": 4,
-      "offset": "0xCC",
-      "width": 4,
-      "irq_mask": "0x0080",
-      "name": "USR0_LDPC_STAT",
-      "description": "用户0 LDPC统计: ERR[15:0], NUM[31:16]"
-    },
-    {
-      "page": 0,
-      "offset": "0xA0",
-      "width": 4,
-      "irq_mask": "0x0003",
-      "name": "BR_CSMA_TIME",
-      "description": "BR时间[15:0] + CSMA时间[31:16] (BB_REG_PAGE0_A0)"
-    },
-    {
-      "page": 0,
-      "offset": "0xB0",
-      "width": 4,
-      "irq_mask": "0x0200",
-      "name": "SWEEP_TIME",
-      "description": "扫频时间[15:0] (BB_REG_PAGE0_B0)"
-    }
-  ]
+    "items": [
+        {
+            "page": 4,
+            "offset": "0x5C",
+            "width": 4,
+            "irq_mask": "0x0003",
+            "name": "FSM_CUR_STATE",
+            "description": "FSM当前状态 bit[28:24] (BB_REG_PAGE4_5C)"
+        },
+        {
+            "page": 4,
+            "offset": "0xDC",
+            "width": 4,
+            "irq_mask": "0x0003",
+            "name": "LOCK_STATUS",
+            "description": "锁定状态: BR_LOCK[16], FCH_LOCK[31:28], SLOT_LOCK[27:24], BR_LDPC_ERR[7:0]"
+        },
+        {
+            "page": 0,
+            "offset": "0xD0",
+            "width": 4,
+            "irq_mask": "0x0003",
+            "name": "RF_BR_FREQ",
+            "description": "BR 频点 (BB_REG_PAGE0_D0)"
+        },
+        {
+            "page": 0,
+            "offset": "0xD8",
+            "width": 4,
+            "irq_mask": "0x0002",
+            "name": "RF_DW_FREQ_0",
+            "description": "下行TX频点0 (Slot TX) (BB_REG_PAGE0_D8)"
+        },
+        {
+            "page": 0,
+            "offset": "0xE8",
+            "width": 4,
+            "irq_mask": "0x0001",
+            "name": "RF_UP_FREQ_0",
+            "description": "上行RX频点0 (Slot RX) (BB_REG_PAGE0_E8)"
+        },
+        {
+            "page": 0,
+            "offset": "0xF8",
+            "width": 4,
+            "irq_mask": "0x0004",
+            "name": "RF_CSMA_FREQ",
+            "description": "CSMA 频点 (BB_REQ_PAGE0_F8)"
+        },
+        {
+            "page": 1,
+            "offset": "0x54",
+            "width": 4,
+            "irq_mask": "0xFFFF",
+            "name": "USR0_PA_POWER",
+            "description": "用户0 PA状态: PA_ON_2G[25:24], PA_ON_5G[27:26], TX_REF_GAIN[13:8]"
+        },
+        {
+            "page": 1,
+            "offset": "0x84",
+            "width": 4,
+            "irq_mask": "0x0200",
+            "name": "FS_PA_STATE",
+            "description": "扫频PA状态: FS_2G_PA_ON[25:24], FS_RX_AGAIN[7:0]",
+            "post_process": {
+                "split": [
+                    {
+                        "name": "FS_2G_PA_ON",
+                        "bit_range": [
+                            25,
+                            24
+                        ]
+                    },
+                    {
+                        "name": "FS_RX_AGAIN",
+                        "bit_range": [
+                            7,
+                            0
+                        ]
+                    }
+                ]
+            }
+        },
+        {
+            "page": 5,
+            "offset": "0x28",
+            "width": 4,
+            "irq_mask": "0x0200",
+            "name": "POWER_TD",
+            "description": "时域功率 / 扫频功率 (BB_REG_PAGE5_28)",
+            "post_process": {
+                "transform": "10 * math.log10(x / 64) if x > 0 else 0"
+            }
+        },
+        {
+            "page": 4,
+            "offset": "0xA0",
+            "width": 4,
+            "irq_mask": "0x0001",
+            "name": "BR_SNR",
+            "description": "BR SNR值 bit[15:0] (BB_REG_PAGE4_A0)"
+        },
+        {
+            "page": 4,
+            "offset": "0x60",
+            "width": 4,
+            "irq_mask": "0x0080",
+            "name": "SNR_DOUT",
+            "description": "SNR输出: QAM_SNR[15:0], PREAM_SNR[31:16] (BB_REG_PAGE4_60)"
+        },
+        {
+            "page": 4,
+            "offset": "0x70",
+            "width": 4,
+            "irq_mask": "0x0080",
+            "name": "USR0_SNR",
+            "description": "用户0 Slot SNR bit[15:0] (BB_REG_PAGE4_70)"
+        },
+        {
+            "page": 4,
+            "offset": "0x50",
+            "width": 8,
+            "irq_mask": "0x0001",
+            "name": "BR_GAIN",
+            "description": "BR AGC增益: GAIN0[15:0], GAIN1[31:16], GAIN2[47:32], GAIN3[63:48]"
+        },
+        {
+            "page": 4,
+            "offset": "0x08",
+            "width": 4,
+            "irq_mask": "0x0080",
+            "name": "USER0_GAIN_0",
+            "description": "用户0 AGC增益0 bit[31:16] (BB_REG_PAGE4_08)"
+        },
+        {
+            "page": 4,
+            "offset": "0x0C",
+            "width": 4,
+            "irq_mask": "0x0080",
+            "name": "USER0_GAIN_1_2",
+            "description": "用户0 AGC增益1[15:0], 增益2[31:16] (BB_REG_PAGE4_0C)"
+        },
+        {
+            "page": 4,
+            "offset": "0x10",
+            "width": 4,
+            "irq_mask": "0x0080",
+            "name": "USER0_GAIN_3",
+            "description": "用户0 AGC增益3 bit[15:0] (BB_REG_PAGE4_10)"
+        },
+        {
+            "page": 4,
+            "offset": "0x40",
+            "width": 8,
+            "irq_mask": "0x0004",
+            "name": "CSMA_GAIN",
+            "description": "CSMA AGC增益 (BB_REG_PAGE4_40~44)"
+        },
+        {
+            "page": 1,
+            "offset": "0x28",
+            "width": 8,
+            "irq_mask": "0xFFFF",
+            "name": "AAGC_RSSI_GAIN",
+            "description": "AAGC RSSI增益1-6: G1[23:16], G2[31:24], G3[39:32], G4[47:40], G5[55:48], G6[63:56]"
+        },
+        {
+            "page": 5,
+            "offset": "0x30",
+            "width": 4,
+            "irq_mask": "0xFFFF",
+            "name": "RX_GAIN_TOTAL",
+            "description": "RX总增益: RX1[23:16], RX2[31:24] (BB_REG_PAGE5_30)"
+        },
+        {
+            "page": 4,
+            "offset": "0xB0",
+            "width": 4,
+            "irq_mask": "0x0100",
+            "name": "FCH_RECV_INFO",
+            "description": "FCH接收信息: QAM_MODE[2:0], LDPC_MODE[6:3], FCH_CHECK_OK[7]"
+        },
+        {
+            "page": 4,
+            "offset": "0xCC",
+            "width": 4,
+            "irq_mask": "0x0080",
+            "name": "USR0_LDPC_STAT",
+            "description": "用户0 LDPC统计: ERR[15:0], NUM[31:16]"
+        },
+        {
+            "page": 0,
+            "offset": "0xA0",
+            "width": 4,
+            "irq_mask": "0x0003",
+            "name": "BR_CSMA_TIME",
+            "description": "BR时间[15:0] + CSMA时间[31:16] (BB_REG_PAGE0_A0)"
+        },
+        {
+            "page": 0,
+            "offset": "0xB0",
+            "width": 4,
+            "irq_mask": "0x0200",
+            "name": "SWEEP_TIME",
+            "description": "扫频时间[15:0] (BB_REG_PAGE0_B0)"
+        }
+    ]
 }

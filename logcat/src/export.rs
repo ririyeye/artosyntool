@@ -378,7 +378,11 @@ fn process_reg_data(
                         "irq_type".to_string(),
                     ];
                     if let Some(ref desc) = reg_descriptor {
-                        header.extend(desc.field_names());
+                        // header.extend(desc.field_names());
+                        // 强制使用地址格式作为 CSV 表头，方便后处理脚本统一处理
+                        for field in &desc.fields {
+                            header.push(format!("reg_p{}_0x{:02X}", field.page, field.offset));
+                        }
                     } else if let Some(ref cfg) = chunk_config {
                         // 从 chunk_config 生成默认字段名
                         for item in cfg.items.iter() {

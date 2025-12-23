@@ -8,9 +8,12 @@
 //! - 通道0: logcat 文本
 //! - 通道1: 寄存器跟踪数据（二进制格式）
 
+#[cfg(feature = "remote")]
 mod export;
 mod local;
+#[cfg(feature = "remote")]
 mod reg_meta;
+#[cfg(feature = "remote")]
 mod remote;
 
 use anyhow::Result;
@@ -20,8 +23,11 @@ use tracing_subscriber::FmtSubscriber;
 
 const DEFAULT_OUTPUT: &str = "/factory/rslog.dat";
 const DEFAULT_MAX_SIZE: u64 = 3_145_728; // 3 MB
+#[cfg(feature = "remote")]
 const REMOTE_DEFAULT_OUTPUT: &str = "rslog_remote.dat";
+#[cfg(feature = "remote")]
 const REMOTE_DEFAULT_MAX_SIZE: u64 = 64 * 1024 * 1024; // 64 MB
+#[cfg(feature = "remote")]
 const DEFAULT_REG_PORT: u16 = 12345;
 
 #[derive(Parser)]
@@ -53,6 +59,7 @@ enum Commands {
         cmd: String,
     },
 
+    #[cfg(feature = "remote")]
     /// 远程模式: 通过 SSH 远程执行 ar_logcat，同时抓取寄存器数据
     Remote {
         /// SSH 主机地址
@@ -88,6 +95,7 @@ enum Commands {
         config: Option<String>,
     },
 
+    #[cfg(feature = "remote")]
     /// 导出已录制的 rslog 数据
     Export {
         /// 输入 rslog 文件路径
@@ -131,6 +139,7 @@ async fn main() -> Result<()> {
             info!("logcat: Max size: {} bytes", max_size);
             local::run_local(&output, &cmd, max_size).await?;
         }
+        #[cfg(feature = "remote")]
         Some(Commands::Remote {
             host,
             port,
@@ -176,6 +185,7 @@ async fn main() -> Result<()> {
             })
             .await?;
         }
+        #[cfg(feature = "remote")]
         Some(Commands::Export { input, out_dir }) => {
             info!("logcat: Export mode, input: {}", input);
             info!("logcat: Export dir: {}", out_dir);

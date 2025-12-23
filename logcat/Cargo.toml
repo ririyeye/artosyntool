@@ -7,16 +7,20 @@ description = "Log capture tool using ar_dbg_client and rslog"
 [lints]
 workspace = true
 
+[features]
+default = ["remote"]
+remote = ["russh", "ar_dbg_client"]
+
 [dependencies]
 # 本地依赖
-ar_dbg_client = { path = "../ar_dbg_client" }
+ar_dbg_client = { path = "../ar_dbg_client", optional = true }
 rslog = { path = "../rslog" }
 
 # 异步运行时
 tokio = { version = "1", features = ["full", "process"] }
 
-# SSH 远程连接
-russh = "0.55"
+# SSH 远程连接（仅 remote 模式需要）
+russh = { version = "0.55", optional = true }
 
 # 命令行
 clap = { version = "4", features = ["derive"] }

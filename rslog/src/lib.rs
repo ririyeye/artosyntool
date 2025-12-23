@@ -47,5 +47,5 @@ pub mod stream_storage {
 }
 
 pub use entry::StreamEntry;
-pub use stream_log::{StreamLog, StreamStats};
+pub use stream_log::{OpenResult, SessionStats, StreamLog, StreamStats};
 pub use writer::{BlockWriter, StreamWriter};

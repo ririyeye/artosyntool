@@ -25,6 +25,36 @@ pub struct StreamStats {
     pub boot_count: u32,
 }
 
+/// 会话写入统计
+#[derive(Debug, Clone, Default)]
+pub struct SessionStats {
+    /// 本次会话写入的字节数
+    pub bytes_written: u64,
+    /// 本次会话写入的条目数
+    pub entries_written: u64,
+    /// 是否发生过回绕
+    pub wrapped: bool,
+    /// 回绕次数
+    pub wrap_count: u32,
+    /// 本次会话开始的写入位置
+    pub initial_write_pos: u64,
+}
+
+impl std::fmt::Display for SessionStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Session: {:.1}KB written, {} entries",
+            self.bytes_written as f64 / 1024.0,
+            self.entries_written
+        )?;
+        if self.wrapped {
+            write!(f, ", wrapped {} time(s)", self.wrap_count)?;
+        }
+        Ok(())
+    }
+}
+
 impl std::fmt::Display for StreamStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "Stream Log Statistics:")?;
@@ -52,18 +82,76 @@ pub struct StreamLog {
     pub(crate) file: File,
     pub(crate) header: StreamHeader,
     pub(crate) dirty: bool,
+    /// 本次会话开始时的写入位置
+    pub(crate) initial_write_pos: u64,
+    /// 本次会话的写入统计
+    pub(crate) session_stats: SessionStats,
+}
+
+/// 打开结果，包含是否重建了文件的信息
+pub struct OpenResult {
+    pub log: StreamLog,
+    pub was_rebuilt: bool,
 }
 
 impl StreamLog {
     /// 打开或创建日志文件
     pub fn open<P: AsRef<Path>>(path: P, max_size: Option<u64>) -> io::Result<Self> {
+        let result = Self::open_with_info(path, max_size)?;
+        Ok(result.log)
+    }
+
+    /// 打开或创建日志文件，并返回是否重建
+    pub fn open_with_info<P: AsRef<Path>>(
+        path: P,
+        max_size: Option<u64>,
+    ) -> io::Result<OpenResult> {
         let path = path.as_ref();
         let max_size = max_size.unwrap_or(3 * 1024 * 1024); // 默认 3MB
 
         if path.exists() {
-            Self::open_existing(path)
+            // 尝试打开现有文件
+            match Self::open_existing(path) {
+                Ok(log) => {
+                    // 打印存储信息
+                    let stats = log.stats();
+                    eprintln!(
+                        "rslog: Opened existing file: used={:.1}KB/{:.1}KB ({:.1}%), boot_count={}, entries={}",
+                        stats.used_size as f64 / 1024.0,
+                        stats.max_size as f64 / 1024.0,
+                        stats.used_size as f64 / stats.max_size as f64 * 100.0,
+                        stats.boot_count,
+                        stats.global_seq
+                    );
+                    Ok(OpenResult {
+                        log,
+                        was_rebuilt: false,
+                    })
+                }
+                Err(e) => {
+                    eprintln!("rslog: Invalid stream log file: {}", e);
+                    eprintln!("rslog: Recreating file...");
+                    let log = Self::create_new(path, max_size)?;
+                    eprintln!(
+                        "rslog: Created new file: max_size={:.1}KB",
+                        max_size as f64 / 1024.0
+                    );
+                    Ok(OpenResult {
+                        log,
+                        was_rebuilt: true,
+                    })
+                }
+            }
         } else {
-            Self::create_new(path, max_size)
+            let log = Self::create_new(path, max_size)?;
+            eprintln!(
+                "rslog: Created new file: max_size={:.1}KB",
+                max_size as f64 / 1024.0
+            );
+            Ok(OpenResult {
+                log,
+                was_rebuilt: false,
+            })
         }
     }
 
@@ -88,6 +176,8 @@ impl StreamLog {
             file,
             header,
             dirty: false,
+            initial_write_pos: 0,
+            session_stats: SessionStats::default(),
         })
     }
 
@@ -103,14 +193,25 @@ impl StreamLog {
             ));
         }
 
+        let initial_write_pos = header.write_pos;
+
         let mut log = Self {
             file,
             header,
             dirty: false,
+            initial_write_pos,
+            session_stats: SessionStats {
+                initial_write_pos,
+                ..Default::default()
+            },
         };
 
         // 扫描恢复：找到真正的最后写入位置（防止断电导致header未更新）
         log.recover_write_pos()?;
+
+        // 更新 initial_write_pos（恢复后可能变化）
+        log.initial_write_pos = log.header.write_pos;
+        log.session_stats.initial_write_pos = log.header.write_pos;
 
         // 恢复：增加启动计数
         log.header.boot_count += 1;
@@ -361,6 +462,8 @@ impl StreamLog {
             );
             // 从头开始写
             write_pos = 0;
+            self.session_stats.wrapped = true;
+            self.session_stats.wrap_count += 1;
         }
 
         // 写入数据
@@ -395,11 +498,36 @@ impl StreamLog {
             }
         }
 
-        // 更新写入位置
+        // 更新写入位置和统计
         self.header.write_pos = write_pos + entry_size;
+        self.session_stats.bytes_written += entry_size;
+        self.session_stats.entries_written += 1;
         self.dirty = true;
 
         Ok(())
+    }
+
+    /// 检查本次会话是否发生了回绕（从开始位置到当前）
+    pub fn has_wrapped(&self) -> bool {
+        self.session_stats.wrapped
+    }
+
+    /// 检查指定位置是否已被本次会话覆盖
+    /// 如果回绕发生，且 pos 在 initial_write_pos 和当前 write_pos 之间（考虑回绕），则已被覆盖
+    pub fn is_position_overwritten(&self, pos: u64) -> bool {
+        if !self.session_stats.wrapped {
+            // 没有回绕，只有 initial_write_pos 之后的部分被写入
+            pos >= self.initial_write_pos && pos < self.header.write_pos
+        } else {
+            // 发生了回绕
+            // 回绕后：0 到 write_pos 是新数据，initial_write_pos 到 max_size 之间的旧数据也被覆盖
+            pos < self.header.write_pos || pos >= self.initial_write_pos
+        }
+    }
+
+    /// 获取本次会话的写入统计
+    pub fn session_stats(&self) -> &SessionStats {
+        &self.session_stats
     }
 
     /// 查看指定位置的条目大小

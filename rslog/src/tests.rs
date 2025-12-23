@@ -738,3 +738,59 @@ fn test_block_writer() {
     println!("=== 块压缩测试通过 ===\n");
     let _ = fs::remove_file(path);
 }
+
+/// 测试无效文件自动重建
+#[test]
+fn test_invalid_file_rebuild() {
+    use std::io::Write;
+
+    let path = "/tmp/test_invalid_rebuild.dat";
+    let _ = fs::remove_file(path);
+
+    println!("\n=== 无效文件重建测试 ===");
+
+    // 创建一个无效文件
+    {
+        let mut f = fs::File::create(path).unwrap();
+        f.write_all(b"this is not a valid rslog file").unwrap();
+    }
+
+    // 尝试打开，应该会检测到无效并重建
+    let result = crate::stream_log::StreamLog::open_with_info(path, Some(64 * 1024));
+    assert!(result.is_ok(), "应该成功打开并重建无效文件");
+
+    let open_result = result.unwrap();
+    assert!(open_result.was_rebuilt, "应该标记为已重建");
+    assert_eq!(
+        open_result.log.stats().write_pos,
+        0,
+        "新文件 write_pos 应为 0"
+    );
+    assert_eq!(
+        open_result.log.stats().boot_count,
+        0,
+        "新文件 boot_count 应为 0"
+    );
+
+    println!("✓ 无效文件已成功重建");
+
+    // 写入一些数据
+    {
+        let mut log = open_result.log;
+        log.write_text("test after rebuild").unwrap();
+        log.sync().unwrap();
+    }
+
+    // 再次打开，应该正常
+    {
+        let result = crate::stream_log::StreamLog::open_with_info(path, None);
+        assert!(result.is_ok());
+        let open_result = result.unwrap();
+        assert!(!open_result.was_rebuilt, "正常文件不应该重建");
+        assert_eq!(open_result.log.stats().boot_count, 1, "boot_count 应该增加");
+        println!("✓ 重建后的文件可以正常打开");
+    }
+
+    println!("=== 无效文件重建测试通过 ===\n");
+    let _ = fs::remove_file(path);
+}

@@ -572,6 +572,25 @@ fn parse_data_chunk(data: &[u8], item_count: usize) -> Vec<(u64, u32, u32, Vec<O
     results
 }
 
+/// 将 irq_type 索引值转换为位掩码
+/// 服务端发送的是 irq_type_e 索引（1-10），需要转换为对应的位掩码值
+/// 索引 1 → 0x0001 (RX_BR_END)
+/// 索引 2 → 0x0002 (TX_BR_END)
+/// ...
+/// 索引 10 → 0x0200 (FREQ_SWEEP)
+fn irq_index_to_mask(irq_type: u32) -> u32 {
+    if irq_type == 0 {
+        0x0000 // UNKNOWN
+    } else if irq_type >= 1 && irq_type <= 10 {
+        1 << (irq_type - 1) // 索引 1 → bit0, 索引 2 → bit1, ...
+    } else if irq_type == 0xFF {
+        0xFFFF // MANUAL
+    } else {
+        eprintln!("WARN: unknown irq_type index {}, using 0xFFFF", irq_type);
+        0xFFFF // 未知值，报错后使用 0xFFFF
+    }
+}
+
 /// 格式化 CSV 行
 /// values 中 None 表示该时间点该项无数据，在 CSV 中输出为空（PlotJuggler 会忽略空值）
 fn format_reg_row(ts_us: u64, seq_id: u32, irq_type: u32, values: &[Option<u32>]) -> String {
@@ -581,7 +600,10 @@ fn format_reg_row(ts_us: u64, seq_id: u32, irq_type: u32, values: &[Option<u32>]
     let ts_sec = ts_us as f64 / 1_000_000.0;
     fields.push(format!("{:.6}", ts_sec));
     fields.push(seq_id.to_string());
-    fields.push(format!("0x{:04X}", irq_type));
+
+    // 将 irq_type 索引转换为位掩码
+    let irq_mask = irq_index_to_mask(irq_type);
+    fields.push(format!("0x{:04X}", irq_mask));
 
     for v in values {
         match v {

@@ -126,6 +126,54 @@ fn pack_data_chunk(records_data: &[u8], record_count: u16) -> Vec<u8> {
     data
 }
 
+/// 写入配置描述块到 writer
+/// 包含二进制配置块和 JSON descriptor
+async fn write_reg_descriptor(
+    writer: &Arc<Mutex<BlockWriter>>,
+    config: &RegTraceConfig,
+) -> Result<()> {
+    // 写入二进制配置块
+    let config_chunk = pack_config_chunk(config);
+    {
+        let mut w = writer.lock().await;
+        w.write_binary_ch(REG_CHANNEL, &config_chunk)?;
+    }
+
+    // 同时写入 JSON descriptor (便于人工查看)
+    let descriptor = RegTraceDescriptor::from_config(config);
+    let json = serde_json::to_string(&descriptor)?;
+    {
+        let mut w = writer.lock().await;
+        w.write_text_ch(REG_CHANNEL, &json)?;
+    }
+    Ok(())
+}
+
+/// 检查是否需要重新写入 descriptor（回绕发生时）
+/// 返回当前的 wrap_count
+async fn check_and_rewrite_descriptor(
+    writer: &Arc<Mutex<BlockWriter>>,
+    config: &RegTraceConfig,
+    last_wrap_count: &mut u32,
+) -> Result<()> {
+    let current_wrap_count = {
+        let w = writer.lock().await;
+        w.session_stats().wrap_count
+    };
+
+    // 如果发生了新的回绕，需要重新写入 descriptor
+    if current_wrap_count > *last_wrap_count {
+        info!(
+            "reg: Storage wrapped (count: {} -> {}), rewriting descriptor",
+            *last_wrap_count, current_wrap_count
+        );
+        write_reg_descriptor(writer, config).await?;
+        *last_wrap_count = current_wrap_count;
+    }
+
+    Ok(())
+}
+
 /// 运行远程模式
 pub async fn run_remote(opts: RemoteOptions<'_>) -> Result<()> {
     // 使用 BlockWriter 进行块压缩写入
@@ -228,11 +276,21 @@ pub async fn run_remote(opts: RemoteOptions<'_>) -> Result<()> {
         let _ = w.flush();
     }
 
+    // 打印本次会话的写入统计
+    if let Ok(w) = writer.try_lock() {
+        let session = w.session_stats();
+        let stats = w.stats();
+        info!("logcat: Recording finished. {}", session);
+        info!(
+            "logcat: Storage: {:.1}KB/{:.1}KB used ({:.1}%)",
+            stats.used_size as f64 / 1024.0,
+            stats.max_size as f64 / 1024.0,
+            stats.used_size as f64 / stats.max_size as f64 * 100.0
+        );
+    }
+
     let total_reg = reg_count.load(Ordering::Relaxed);
-    info!(
-        "logcat: Recording finished. Total register records: {}",
-        total_reg
-    );
+    info!("logcat: Total register records: {}", total_reg);
 
     Ok(())
 }
@@ -249,7 +307,12 @@ async fn run_reg_collector(
     info!("reg: Starting collector, connecting to {}:{}", host, port);
 
     let mut reconnect_count = 0u64;
+    // 跟踪本次会话是否已写入 descriptor
+    // 每次开机只在第一次写数据时写入 descriptor
+    // 后续如果发生回绕覆盖了 descriptor，需要重新写入
     let mut descriptor_written = false;
+    // 上次写入 descriptor 后是否发生过回绕
+    let mut last_wrap_count = 0u32;
 
     let client_config = ClientConfig {
         host: host.to_string(),
@@ -289,6 +352,7 @@ async fn run_reg_collector(
             &running,
             &reg_count,
             &mut descriptor_written,
+            &mut last_wrap_count,
         )
         .await
         {
@@ -329,6 +393,7 @@ async fn run_reg_stream(
     running: &Arc<AtomicBool>,
     reg_count: &Arc<AtomicU64>,
     descriptor_written: &mut bool,
+    last_wrap_count: &mut u32,
 ) -> Result<()> {
     use ar_dbg_client::protocol::{DataPushResponse, Message};
     use bytes::BytesMut;
@@ -352,21 +417,13 @@ async fn run_reg_stream(
 
     // 首次写入配置描述块 (Chunk0)
     if !*descriptor_written {
-        // 写入二进制配置块
-        let config_chunk = pack_config_chunk(config);
-        {
-            let mut w = writer.lock().await;
-            w.write_binary_ch(REG_CHANNEL, &config_chunk)?;
-        }
-
-        // 同时写入 JSON descriptor (便于人工查看)
-        let descriptor = RegTraceDescriptor::from_config(config);
-        let json = serde_json::to_string(&descriptor)?;
-        {
-            let mut w = writer.lock().await;
-            w.write_text_ch(REG_CHANNEL, &json)?;
-        }
+        write_reg_descriptor(writer, config).await?;
         *descriptor_written = true;
+        // 记录当前的回绕次数
+        {
+            let w = writer.lock().await;
+            *last_wrap_count = w.session_stats().wrap_count;
+        }
         info!("reg: Config chunk (Chunk0) and descriptor written");
     }
 
@@ -430,6 +487,11 @@ async fn run_reg_stream(
             batch.clear();
             batch_count = 0;
             last_flush = Instant::now();
+
+            // 检查是否发生回绕，需要重新写入 descriptor
+            if let Err(e) = check_and_rewrite_descriptor(writer, config, last_wrap_count).await {
+                error!("reg: Failed to rewrite descriptor after wrap: {}", e);
+            }
         }
 
         // 使用 select 同时检查停止信号和接收数据
@@ -491,6 +553,11 @@ async fn run_reg_stream(
                                             batch.clear();
                                             batch_count = 0;
                                             last_flush = Instant::now();
+
+                                            // 检查是否发生回绕，需要重新写入 descriptor
+                                            if let Err(e) = check_and_rewrite_descriptor(writer, config, last_wrap_count).await {
+                                                error!("reg: Failed to rewrite descriptor after wrap: {}", e);
+                                            }
                                         }
                                     }
                                 }

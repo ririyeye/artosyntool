@@ -278,6 +278,16 @@ impl BlockWriter {
         &mut self.log
     }
 
+    /// 检查本次会话是否发生了回绕
+    pub fn has_wrapped(&self) -> bool {
+        self.log.has_wrapped()
+    }
+
+    /// 获取本次会话的写入统计
+    pub fn session_stats(&self) -> &crate::stream_log::SessionStats {
+        self.log.session_stats()
+    }
+
     /// 获取缓冲区状态（用于调试）
     pub fn buffer_stats(&self) -> Vec<(u8, usize, usize)> {
         let mut stats = Vec::new();

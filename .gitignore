@@ -10,3 +10,4 @@ test_log/restored_sky.txt
 test_log/test_rslog.dat
 ar_reg_trace
 logcat_export_new
+__pycache__

@@ -2,7 +2,7 @@
 //!
 //! 支持从 JSON 配置文件读取要采集的寄存器列表
 
-use ar_dbg_client::{ConfigRequest, RegTraceItem, DEFAULT_PORT, MAX_ITEMS};
+use ar_dbg_client::{ConfigRequest, RegTraceItem, DEFAULT_PORT};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -167,17 +167,19 @@ impl Default for RegTraceConfig {
 
 impl RegTraceConfig {
     /// 从 JSON 文件加载配置
+    ///
+    /// 注意：不再检查配置项数量限制，因为服务器会自动合并相邻寄存器。
+    /// 如果合并后仍超出限制，服务器会返回 TooManyItems 错误。
     pub fn from_file<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         let content = fs::read_to_string(path.as_ref())?;
         let config: RegTraceConfig = serde_json::from_str(&content)?;
 
-        // 验证配置
+        // 验证配置：只检查是否为空
         if config.items.is_empty() {
             anyhow::bail!("配置文件中 items 不能为空");
         }
-        if config.items.len() > MAX_ITEMS {
-            anyhow::bail!("配置项数量超过最大值 {}", MAX_ITEMS);
-        }
+        // 不再检查 items.len() > MAX_ITEMS，服务器会合并相邻寄存器，
+        // 最终限制由服务器判断并返回错误码
 
         Ok(config)
     }
@@ -203,22 +205,6 @@ impl RegTraceConfig {
             sample_div: self.sample_div,
             buffer_depth: self.buffer_depth,
         }
-    }
-
-    /// 获取字段名称列表（用于 CSV 表头）
-    #[allow(dead_code)]
-    pub fn field_names(&self) -> Vec<String> {
-        self.items
-            .iter()
-            .enumerate()
-            .map(|(_i, item)| {
-                if item.name.is_empty() {
-                    format!("reg_p{}_0x{:02X}", item.page, item.offset)
-                } else {
-                    item.name.clone()
-                }
-            })
-            .collect()
     }
 }
 
@@ -289,11 +275,6 @@ impl RegTraceDescriptor {
             plotjuggler_notes: "CSV第一列timestamp为时间轴(秒)，可直接在PlotJuggler中选择作为X轴"
                 .to_string(),
         }
-    }
-
-    /// 获取字段名称列表
-    pub fn field_names(&self) -> Vec<String> {
-        self.fields.iter().map(|f| f.name.clone()).collect()
     }
 }
 

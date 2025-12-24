@@ -1,4 +1,6 @@
 {
+    "_comment": "1BR 1Slot_TX 1Slot_RX 扫频模式 - 寄存器采样配置",
+    "_width_info": "width 支持 1-32 字节连续读取，超过 32 字节时客户端自动拆分",
     "name": "example_regs",
     "description": "示例寄存器配置",
     "host": "192.168.10.100",
@@ -17,6 +19,15 @@
         "FCH_DEC": "0x0100",
         "FREQ_SWEEP": "0x0200",
         "ALL": "0xFFFF"
+    },
+    "_register_base": {
+        "BB_REG_BASE": "0x60680000",
+        "PAGE0": "0x60680000",
+        "PAGE1": "0x60680100",
+        "PAGE2": "0x60680200",
+        "PAGE3": "0x60680300",
+        "PAGE4": "0x60680400",
+        "PAGE5": "0x60680500"
     },
     "items": [
         {
@@ -224,5 +235,12 @@
             "name": "SWEEP_TIME",
             "description": "扫频时间[15:0] (BB_REG_PAGE0_B0)"
         }
-    ]
+    ],
+    "_example_output": {
+        "_desc": "上报数据按 valid_mask 紧凑排列",
+        "IRQ0_RX_BR_END": "BR锁定、BR频点、BR_SNR、BR_GAIN等BR相关寄存器",
+        "IRQ1_TX_BR_END": "TX频点、PA状态等发送相关寄存器",
+        "IRQ7_RX_RDOUT": "Slot SNR、用户增益、LDPC统计等接收相关寄存器",
+        "IRQ9_FREQ_SWEEP": "扫频功率、扫频时间、FS PA状态等扫频相关寄存器"
+    }
 }

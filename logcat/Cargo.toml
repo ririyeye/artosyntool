@@ -21,7 +21,8 @@ tokio = { version = "1", features = ["full", "process"] }
 
 # SSH 远程连接（仅 remote 模式需要）
 # 使用 ring 后端避免 Windows 上需要 NASM 的问题
-russh = { version = "0.55", optional = true, default-features = false, features = ["ring"] }
+# 启用 dsa 支持以兼容老旧的 dropbear 设备（使用 ssh-dss 密钥）
+russh = { version = "0.55", optional = true, default-features = false, features = ["ring", "dsa"] }
 
 # 命令行
 clap = { version = "4", features = ["derive"] }

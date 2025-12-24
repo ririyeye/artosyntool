@@ -5,13 +5,15 @@ use anyhow::{anyhow, Result};
 use ar_dbg_client::{ClientConfig, RegTraceClient, TraceRecord};
 use rslog::BlockWriter;
 use russh::client;
-use russh::keys::PrivateKeyWithHashAlg;
+use russh::keys::{Algorithm, PrivateKeyWithHashAlg};
+use russh::Preferred;
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Logcat 文本通道号
 const LOGCAT_CHANNEL: u8 = 0;
@@ -48,7 +50,18 @@ pub struct RemoteOptions<'a> {
 }
 
 /// SSH 客户端处理器
-struct SshHandler;
+struct SshHandler {
+    /// 是否已经检查过服务器密钥
+    checked: std::sync::atomic::AtomicBool,
+}
+
+impl SshHandler {
+    fn new() -> Self {
+        Self {
+            checked: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
 
 impl client::Handler for SshHandler {
     type Error = russh::Error;
@@ -57,6 +70,9 @@ impl client::Handler for SshHandler {
         &mut self,
         _server_public_key: &russh::keys::PublicKey,
     ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
+        // 总是接受服务器密钥（跳过 known_hosts 检查）
+        self.checked
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         async { Ok(true) }
     }
 }
@@ -266,9 +282,15 @@ pub async fn run_remote(opts: RemoteOptions<'_>) -> Result<()> {
     // 等待 SSH 任务完成
     let _ = ssh_handle.await;
 
-    // 等待寄存器任务完成
+    // SSH 任务完成后，确保停止 reg 任务
+    running.store(false, Ordering::SeqCst);
+
+    // 等待寄存器任务完成（最多等待 3 秒）
     if let Some(handle) = reg_handle {
-        let _ = handle.await;
+        let timeout = tokio::time::timeout(Duration::from_secs(3), handle).await;
+        if timeout.is_err() {
+            warn!("logcat: Reg task did not stop in time, forcing shutdown");
+        }
     }
 
     // 最终刷新
@@ -405,7 +427,17 @@ async fn run_reg_stream(
 
     let config_resp = client.config(&mut stream, &config_req).await?;
     if config_resp.result != ar_dbg_client::ErrorCode::Ok {
-        return Err(anyhow!("Config failed: {}", config_resp.result));
+        // 根据不同错误码提供更详细的错误信息
+        let err_msg = match config_resp.result {
+            ar_dbg_client::ErrorCode::TooManyItems => {
+                format!(
+                    "服务器拒绝配置: 合并后配置项数量仍超过 RPC 限制(62个)，请减少配置项数量 (当前: {} 项)",
+                    config_req.items.len()
+                )
+            }
+            other => format!("配置失败: {}", other),
+        };
+        return Err(anyhow!("{}", err_msg));
     }
     info!(
         "reg: Config OK: items={}, sample_div={}, buffer={}",
@@ -479,7 +511,7 @@ async fn run_reg_stream(
                     error!("reg: Flush error: {}", e);
                 }
             }
-            info!(
+            debug!(
                 "reg: Periodic flush: {} records ({} bytes)",
                 batch_count,
                 batch.len()
@@ -545,7 +577,7 @@ async fn run_reg_stream(
                                                     error!("reg: Flush error (size limit): {}", e);
                                                 }
                                             }
-                                            info!(
+                                            debug!(
                                                 "reg: Size-triggered flush: {} records ({} bytes)",
                                                 batch_count,
                                                 batch.len()
@@ -594,18 +626,29 @@ async fn run_ssh_logcat(
     running: Arc<AtomicBool>,
     _logcat_count: &AtomicU64,
 ) {
-    // SSH 配置
+    // SSH 配置 - 添加 DSA 支持（dropbear 设备常用）
+    // 默认的 Preferred 不包含 DSA，需要手动添加
+    let mut preferred = Preferred::DEFAULT;
+    // 在 key 算法列表前面添加 DSA，以支持老旧设备
+    let mut key_algos: Vec<Algorithm> = vec![Algorithm::Dsa];
+    key_algos.extend(preferred.key.iter().cloned());
+    preferred.key = Cow::Owned(key_algos);
+
     let config = Arc::new(client::Config {
         inactivity_timeout: Some(Duration::from_secs(3600)),
+        preferred,
         ..Default::default()
     });
 
     // 连接 SSH
     info!("logcat: Connecting to {}:{}...", host, port);
-    let session = match client::connect(config, (host, port), SshHandler).await {
+    let handler = SshHandler::new();
+    let session = match client::connect(config, (host, port), handler).await {
         Ok(s) => s,
         Err(e) => {
             error!("logcat: SSH connection failed: {}", e);
+            // 设置 running 为 false，通知其他任务停止
+            running.store(false, Ordering::SeqCst);
             return;
         }
     };

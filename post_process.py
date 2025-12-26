@@ -29,7 +29,82 @@ def get_reg_key(item):
         
     return f"reg_p{page}_0x{offset:02X}"
 
-def process_row(row, config_items, header_map):
+def create_auto_band_freq_func(func_def):
+    """
+    根据 JSON 定义创建自动频段判断函数
+    
+    func_def 格式:
+    {
+        "type": "auto_band_freq",
+        "extract": {"rf_ch_int": "x & 0xff", "rf_ch_frac": "..."},
+        "freq_formula": "((rf_multi * rf_ch_int + ...) + 1) & 0xfffffffe",
+        "bands": {
+            "5G": {"rf_multi": 60000, "min": 5000000, "max": 6000000},
+            "2G": {"rf_multi": 30000, "min": 2000000, "max": 3000000}
+        }
+    }
+    """
+    extract_exprs = func_def.get('extract', {})
+    freq_formula = func_def.get('freq_formula', '')
+    bands = func_def.get('bands', {})
+    
+    def auto_band_freq(x):
+        # 计算提取变量
+        local_vars = {'x': x, 'math': math}
+        for var_name, expr in extract_exprs.items():
+            local_vars[var_name] = eval(expr, {"__builtins__": None}, local_vars)
+        
+        # 尝试每个频段
+        results = []
+        for band_name, band_cfg in bands.items():
+            rf_multi = band_cfg['rf_multi']
+            freq_min = band_cfg['min']
+            freq_max = band_cfg['max']
+            
+            # 计算频率
+            calc_vars = {**local_vars, 'rf_multi': rf_multi}
+            freq = eval(freq_formula, {"__builtins__": None}, calc_vars)
+            
+            if freq_min <= freq <= freq_max:
+                return freq, band_name
+            results.append((band_name, freq))
+        
+        # 无法确定频段，返回第一个计算值和调试信息
+        if results:
+            debug_info = ','.join([f"{b}={f}" for b, f in results])
+            return results[0][1], f"??({debug_info})"
+        return 0, "??"
+    
+    return auto_band_freq
+
+
+def build_predefined_funcs(func_defs):
+    """
+    从 JSON 定义构建预定义函数表
+    
+    func_defs: JSON 中的 predefined_funcs 字典
+    返回: {func_name: callable}
+    """
+    funcs = {}
+    
+    for name, definition in func_defs.items():
+        if name.startswith('_'):  # 跳过注释字段
+            continue
+            
+        func_type = definition.get('type', '')
+        
+        if func_type == 'auto_band_freq':
+            funcs[name] = create_auto_band_freq_func(definition)
+        elif func_type == 'transform':
+            # 简单表达式类型
+            expr = definition.get('expr', 'x')
+            funcs[name] = lambda x, e=expr: eval(e, {"__builtins__": None, "math": math, "x": x})
+    
+    return funcs
+
+def process_row(row, config_items, header_map, predefined_funcs=None):
+    if predefined_funcs is None:
+        predefined_funcs = {}
     new_row = {}
     # Copy existing fields
     for k, v in row.items():
@@ -87,6 +162,23 @@ def process_row(row, config_items, header_map):
             except Exception as e:
                 new_row[f"{friendly_name}_err"] = f"Error: {e}"
 
+        # Handle Func
+        if 'func' in pp:
+            func_name = pp['func']
+            if func_name in predefined_funcs:
+                try:
+                    res = predefined_funcs[func_name](raw_val)
+                    target_name = friendly_name if friendly_name else f"{reg_key}_processed"
+                    
+                    if isinstance(res, tuple):
+                        new_row[target_name] = res[0]
+                        if len(res) > 1:
+                            new_row[f"{target_name}_info"] = res[1]
+                    else:
+                        new_row[target_name] = res
+                except Exception as e:
+                    new_row[f"{friendly_name}_err"] = f"Error: {e}"
+
     return new_row
 
 def main():
@@ -102,6 +194,7 @@ def main():
     with open(config_path, 'r', encoding='utf-8') as f:
         config = json.load(f)
 
+    predefined_funcs = build_predefined_funcs(config.get('predefined_funcs', {}))
     config_items = config.get('items', [])
 
     # Collect all new field names
@@ -112,15 +205,25 @@ def main():
         pp = item.get('post_process')
         friendly_name = item.get('name')
         
+        if friendly_name:
+            processed_fields.append(friendly_name)
+        
         if pp:
             if 'split' in pp:
                 for split_item in pp['split']:
                     processed_fields.append(split_item['name'])
             if 'transform' in pp:
-                processed_fields.append(friendly_name if friendly_name else f"{get_reg_key(item)}_processed")
-        else:
-            if friendly_name:
-                processed_fields.append(friendly_name)
+                if not friendly_name:
+                    processed_fields.append(f"{get_reg_key(item)}_processed")
+            if 'func' in pp:
+                target_name = friendly_name if friendly_name else f"{get_reg_key(item)}_processed"
+                if not friendly_name:
+                    processed_fields.append(target_name)
+                # Check if it returns tuple (auto_band_freq)
+                func_name = pp['func']
+                func_def = config.get('predefined_funcs', {}).get(func_name)
+                if func_def and func_def.get('type') == 'auto_band_freq':
+                    processed_fields.append(f"{target_name}_info")
 
     # Process CSV
     with open(input_csv, 'r', newline='', encoding='utf-8') as f_in, \
@@ -136,7 +239,7 @@ def main():
 
         writer.writeheader()
         for row in reader:
-            processed_row = process_row(row, config_items, {n: i for i, n in enumerate(reader.fieldnames)})
+            processed_row = process_row(row, config_items, {n: i for i, n in enumerate(reader.fieldnames)}, predefined_funcs)
             writer.writerow(processed_row)
 
     print(f"Processed data saved to {output_csv}")

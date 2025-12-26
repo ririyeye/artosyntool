@@ -1,6 +1,26 @@
 {
     "_comment": "1BR 1Slot_TX 1Slot_RX 扫频模式 - 寄存器采样配置",
     "_width_info": "width 支持 1-32 字节连续读取，超过 32 字节时客户端自动拆分",
+    "_post_process_info": {
+        "_说明": "post_process 支持: func(调用predefined_funcs), transform(表达式), split(位域拆分)",
+        "_用法示例": "{ \"func\": \"reg_freq_khz\" }"
+    },
+    "predefined_funcs": {
+        "_说明": "预定义函数，可在 post_process.func 中引用",
+        "reg_freq_khz": {
+            "type": "auto_band_freq",
+            "description": "BR频率计算(自动判断5G/2G)，返回 (freq_khz, band)",
+            "extract": {
+                "rf_ch_int": "x & 0xff",
+                "rf_ch_frac": "((x >> 24) & 0xff) | (((x >> 16) & 0xff) << 8) | (((x >> 8) & 0xff) << 16)"
+            },
+            "freq_formula": "((rf_multi * rf_ch_int + (rf_multi * rf_ch_frac) // 16777216) + 1) & 0xfffffffe",
+            "bands": {
+                "5G": {"rf_multi": 60000, "min": 5000000, "max": 6000000},
+                "2G": {"rf_multi": 30000, "min": 2000000, "max": 3000000}
+            }
+        }
+    },
     "name": "example_regs",
     "description": "示例寄存器配置",
     "host": "192.168.10.100",
@@ -32,208 +52,141 @@
     "items": [
         {
             "page": 4,
-            "offset": "0x5C",
+            "offset": "0x08",
             "width": 4,
-            "irq_mask": "0x0003",
-            "name": "FSM_CUR_STATE",
-            "description": "FSM当前状态 bit[28:24] (BB_REG_PAGE4_5C)"
+            "irq_mask": "0x0020",
+            "name": "slot0_gain0",
+            "description": "slot0 gain ch0 (from BB_REG_PAGE4_08 USER0_GAIN high16)",
+            "post_process": {
+                "transform": "(((x >> 24) & 0xff) + ((x >> 16) & 0xff))"
+            }
         },
         {
             "page": 4,
-            "offset": "0xDC",
+            "offset": "0x0C",
             "width": 4,
-            "irq_mask": "0x0003",
-            "name": "LOCK_STATUS",
-            "description": "锁定状态: BR_LOCK[16], FCH_LOCK[31:28], SLOT_LOCK[27:24], BR_LDPC_ERR[7:0]"
-        },
-        {
-            "page": 0,
-            "offset": "0xD0",
-            "width": 4,
-            "irq_mask": "0x0003",
-            "name": "RF_BR_FREQ",
-            "description": "BR 频点 (BB_REG_PAGE0_D0)"
-        },
-        {
-            "page": 0,
-            "offset": "0xD8",
-            "width": 4,
-            "irq_mask": "0x0002",
-            "name": "RF_DW_FREQ_0",
-            "description": "下行TX频点0 (Slot TX) (BB_REG_PAGE0_D8)"
-        },
-        {
-            "page": 0,
-            "offset": "0xE8",
-            "width": 4,
-            "irq_mask": "0x0001",
-            "name": "RF_UP_FREQ_0",
-            "description": "上行RX频点0 (Slot RX) (BB_REG_PAGE0_E8)"
-        },
-        {
-            "page": 0,
-            "offset": "0xF8",
-            "width": 4,
-            "irq_mask": "0x0004",
-            "name": "RF_CSMA_FREQ",
-            "description": "CSMA 频点 (BB_REQ_PAGE0_F8)"
-        },
-        {
-            "page": 1,
-            "offset": "0x54",
-            "width": 4,
-            "irq_mask": "0xFFFF",
-            "name": "USR0_PA_POWER",
-            "description": "用户0 PA状态: PA_ON_2G[25:24], PA_ON_5G[27:26], TX_REF_GAIN[13:8]"
-        },
-        {
-            "page": 1,
-            "offset": "0x84",
-            "width": 4,
-            "irq_mask": "0x0200",
-            "name": "FS_PA_STATE",
-            "description": "扫频PA状态: FS_2G_PA_ON[25:24], FS_RX_AGAIN[7:0]",
+            "irq_mask": "0x0020",
+            "name": "slot0_gain1",
+            "description": "slot0 gain ch1 (from BB_REG_PAGE4_0C USER0_GAIN_1 low16)",
             "post_process": {
-                "split": [
-                    {
-                        "name": "FS_2G_PA_ON",
-                        "bit_range": [
-                            25,
-                            24
-                        ]
-                    },
-                    {
-                        "name": "FS_RX_AGAIN",
-                        "bit_range": [
-                            7,
-                            0
-                        ]
-                    }
-                ]
+                "transform": "(((x >> 8) & 0xff) + (x & 0xff))"
             }
         },
         {
             "page": 5,
-            "offset": "0x28",
+            "offset": "0xFC",
             "width": 4,
-            "irq_mask": "0x0200",
-            "name": "POWER_TD",
-            "description": "时域功率 / 扫频功率 (BB_REG_PAGE5_28)",
+            "irq_mask": "0x0020",
+            "name": "FCH_STATE",
+            "description": "FCH State (BB_REG_PAGE5_FC[23])",
+            "post_process": {
+                "transform": "(x >> 23) & 0x1"
+            }
+        },
+        {
+            "page": 4,
+            "offset": "0xE0",
+            "width": 4,
+            "irq_mask": "0x0020",
+            "name": "USER_INDEX",
+            "description": "User Index (BB_REG_PAGE4_E0[3:2])",
+            "post_process": {
+                "transform": "(x >> 2) & 0x3"
+            }
+        },
+        {
+            "page": 4,
+            "offset": "0x70",
+            "width": 2,
+            "irq_mask": "0x0020",
+            "name": "USR0_SNR",
+            "description": "User0 raw SNR (BB_REG_PAGE4_70)",
             "post_process": {
                 "transform": "10 * math.log10(x / 64) if x > 0 else 0"
             }
         },
         {
             "page": 4,
-            "offset": "0xA0",
+            "offset": "0xCC",
             "width": 4,
-            "irq_mask": "0x0001",
-            "name": "BR_SNR",
-            "description": "BR SNR值 bit[15:0] (BB_REG_PAGE4_A0)"
-        },
-        {
-            "page": 4,
-            "offset": "0x60",
-            "width": 4,
-            "irq_mask": "0x0080",
-            "name": "SNR_DOUT",
-            "description": "SNR输出: QAM_SNR[15:0], PREAM_SNR[31:16] (BB_REG_PAGE4_60)"
-        },
-        {
-            "page": 4,
-            "offset": "0x70",
-            "width": 4,
-            "irq_mask": "0x0080",
-            "name": "USR0_SNR",
-            "description": "用户0 Slot SNR bit[15:0] (BB_REG_PAGE4_70)"
-        },
-        {
-            "page": 4,
-            "offset": "0x50",
-            "width": 8,
-            "irq_mask": "0x0001",
-            "name": "BR_GAIN",
-            "description": "BR AGC增益: GAIN0[15:0], GAIN1[31:16], GAIN2[47:32], GAIN3[63:48]"
-        },
-        {
-            "page": 4,
-            "offset": "0x08",
-            "width": 4,
-            "irq_mask": "0x0080",
-            "name": "USER0_GAIN_0",
-            "description": "用户0 AGC增益0 bit[31:16] (BB_REG_PAGE4_08)"
-        },
-        {
-            "page": 4,
-            "offset": "0x0C",
-            "width": 4,
-            "irq_mask": "0x0080",
-            "name": "USER0_GAIN_1_2",
-            "description": "用户0 AGC增益1[15:0], 增益2[31:16] (BB_REG_PAGE4_0C)"
-        },
-        {
-            "page": 4,
-            "offset": "0x10",
-            "width": 4,
-            "irq_mask": "0x0080",
-            "name": "USER0_GAIN_3",
-            "description": "用户0 AGC增益3 bit[15:0] (BB_REG_PAGE4_10)"
-        },
-        {
-            "page": 4,
-            "offset": "0x40",
-            "width": 8,
-            "irq_mask": "0x0004",
-            "name": "CSMA_GAIN",
-            "description": "CSMA AGC增益 (BB_REG_PAGE4_40~44)"
-        },
-        {
-            "page": 1,
-            "offset": "0x28",
-            "width": 8,
-            "irq_mask": "0xFFFF",
-            "name": "AAGC_RSSI_GAIN",
-            "description": "AAGC RSSI增益1-6: G1[23:16], G2[31:24], G3[39:32], G4[47:40], G5[55:48], G6[63:56]"
+            "irq_mask": "0x0020",
+            "name": "USR0_LDPC_STAT",
+            "description": "LDPC stats for user0 (ERR low16, NUM high16)",
+            "post_process": {
+                "split": [
+                    {"name": "USR0_LDPC_ERR", "bit_range": [15, 0]},
+                    {"name": "USR0_LDPC_NUM", "bit_range": [31, 16]}
+                ]
+            }
         },
         {
             "page": 5,
-            "offset": "0x30",
+            "offset": "0xF8",
             "width": 4,
-            "irq_mask": "0xFFFF",
-            "name": "RX_GAIN_TOTAL",
-            "description": "RX总增益: RX1[23:16], RX2[31:24] (BB_REG_PAGE5_30)"
+            "irq_mask": "0x0020",
+            "name": "HARQ_REQ_U0",
+            "description": "HARQ request count for user0 (bits 19:16 of BB_REG_PAGE5_F8)",
+            "post_process": {
+                "transform": "(x >> 16) & 0xF"
+            }
         },
         {
             "page": 4,
-            "offset": "0xB0",
+            "offset": "0xF0",
             "width": 4,
-            "irq_mask": "0x0100",
-            "name": "FCH_RECV_INFO",
-            "description": "FCH接收信息: QAM_MODE[2:0], LDPC_MODE[6:3], FCH_CHECK_OK[7]"
-        },
-        {
-            "page": 4,
-            "offset": "0xCC",
-            "width": 4,
-            "irq_mask": "0x0080",
-            "name": "USR0_LDPC_STAT",
-            "description": "用户0 LDPC统计: ERR[15:0], NUM[31:16]"
+            "irq_mask": "0x0020",
+            "name": "HARQ_TIMES_U0",
+            "description": "HARQ retry times for user0 (bits 19:16 of BB_REG_PAGE4_F0)",
+            "post_process": {
+                "transform": "(x >> 16) & 0xF"
+            }
         },
         {
             "page": 0,
-            "offset": "0xA0",
+            "offset": "0xD0",
             "width": 4,
             "irq_mask": "0x0003",
-            "name": "BR_CSMA_TIME",
-            "description": "BR时间[15:0] + CSMA时间[31:16] (BB_REG_PAGE0_A0)"
+            "name": "FREQ_BR",
+            "description": "BR 频率 (自动判断 5G/2G 频段)，单位 kHz",
+            "post_process": {
+                "func": "reg_freq_khz"
+            }
         },
         {
             "page": 0,
-            "offset": "0xB0",
+            "offset": "0xD4",
             "width": 4,
-            "irq_mask": "0x0200",
-            "name": "SWEEP_TIME",
-            "description": "扫频时间[15:0] (BB_REG_PAGE0_B0)"
+            "irq_mask": "0x0003",
+            "name": "FREQ_FS",
+            "description": "BR FS 频率 (自动判断 5G/2G)，单位 kHz (BB_REG_PAGE0_D4)",
+            "post_process": { "func": "reg_freq_khz" }
+        },
+        {
+            "page": 0,
+            "offset": "0xD8",
+            "width": 4,
+            "irq_mask": "0x0003",
+            "name": "FREQ_DW",
+            "description": "BR DW 频率开始 (自动判断 5G/2G)，单位 kHz (BB_REG_PAGE0_D8)",
+            "post_process": { "func": "reg_freq_khz" }
+        },
+        {
+            "page": 0,
+            "offset": "0xE8",
+            "width": 4,
+            "irq_mask": "0x0003",
+            "name": "FREQ_UP",
+            "description": "BR UP 频率开始 (自动判断 5G/2G)，单位 kHz (BB_REG_PAGE0_E8)",
+            "post_process": { "func": "reg_freq_khz" }
+        },
+        {
+            "page": 0,
+            "offset": "0xF8",
+            "width": 4,
+            "irq_mask": "0x0003",
+            "name": "FREQ_CSMA",
+            "description": "BR CSMS 频率 (自动判断 5G/2G)，单位 kHz (BB_REG_PAGE0_F8)",
+            "post_process": { "func": "reg_freq_khz" }
         }
     ],
     "_example_output": {

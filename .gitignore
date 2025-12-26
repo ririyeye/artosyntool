@@ -11,3 +11,4 @@ test_log/test_rslog.dat
 ar_reg_trace
 logcat_export_new
 __pycache__
+*.csv
